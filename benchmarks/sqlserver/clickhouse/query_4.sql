@@ -1,0 +1,2 @@
+SELECT AVG(CAST(UserID AS DECIMAL(38, 0)))
+FROM hits;

@@ -1,0 +1,4 @@
+SELECT SUM(CAST(AdvEngineID AS BIGINT)),
+  COUNT_BIG(*),
+  AVG(CAST(ResolutionWidth AS BIGINT))
+FROM hits;
