@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import logging
+import math
 import sys
 import time
 from typing import Dict
@@ -31,6 +32,25 @@ from pilotdb.utils.utils import dump_results, get_largest_sample_rate, setup_log
 warnings.simplefilter(action="ignore", category=UserWarning)
 
 
+def _min_pilot_rate_for_groups(
+    table_size: int, block_size: int = 8192,
+    min_group_size: int = 200, p_fail: float = 0.05
+) -> float:
+    """[FIX B6] Paper Lemma 3.2 (§3.1, Eq. 7)
+    Compute minimum pilot sampling rate to ensure groups of size >= g
+    are not missed with probability p_fail.
+    θ >= 1 - (1 - (1-p_f)^(⌈g/b⌉/|T|))^(1/⌈g/b⌉)
+    """
+    blocks_per_group = math.ceil(min_group_size / block_size)
+    total_blocks = max(math.ceil(table_size / block_size), 1)
+    try:
+        base = (1 - p_fail) ** (blocks_per_group / total_blocks)
+        theta_min = 1 - base ** (1.0 / blocks_per_group)
+        return max(theta_min * 100, 0.01)  # percent, at least 0.01%
+    except (ValueError, ZeroDivisionError):
+        return 0.05  # default fallback
+
+
 def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
     # prepare the query and db
     dbms = db_config["dbms"]
@@ -40,6 +60,24 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
     sq = Sampling_Rewriter(query.table_cols, query.table_size, dbms)
     pilot_query = pq.rewrite(query.query) + ";"
     sampling_query = sq.rewrite(query.query) + ";"
+
+    # [FIX B6] Lemma 3.2: adjust pilot rate for GROUP BY queries
+    has_group_by = len(pq.group_cols) > 0
+    if has_group_by and query.table_size:
+        largest_table_name = next(iter(query.table_size), None)
+        if largest_table_name:
+            largest_table_size = query.table_size[largest_table_name]
+            min_rate = _min_pilot_rate_for_groups(
+                table_size=largest_table_size,
+                min_group_size=200, p_fail=0.05
+            )
+            if min_rate > pilot_sample_rate:
+                logging.info(
+                    f"[Lemma 3.2] Adjusting pilot rate from {pilot_sample_rate}% "
+                    f"to {min_rate:.4f}% for group coverage"
+                )
+                pilot_sample_rate = min_rate
+
     sampling_clause = get_sampling_clause(pilot_sample_rate, dbms)
     pilot_query = pilot_query.format(sampling_method=sampling_clause)
 

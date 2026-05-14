@@ -158,7 +158,9 @@ def estimate_final_rate(
     n_est = n_groups * (n_page_stats * 3 + page_size_stats * 2 + 1)
     candidate_sample_rate = []
     try:
-        fp = 1 - math.pow(1 - failure_prob, 1 / n_est)
+        # [FIX B3] Paper §3.1: Boole's inequality additive form
+        # Paper: fp_each = (1-p) / (k*m), NOT multiplicative 1-(1-fp)^(1/n)
+        fp = failure_prob / n_est
         for col, error in page_errors.items():
             if len(group_cols) > 0:
                 for group_i in range(n_groups):
@@ -172,8 +174,12 @@ def estimate_final_rate(
                         sample_mean = df[(col, "mean")].iloc[group_i]
                         sample_std = df[(col, "std")].iloc[group_i]
                         sample_size = df[(col, "size")].iloc[group_i]
+                        # [FIX B4] Paper Procedure 1: δ₁=δ₂=(1-p)/3
+                        # Split failure budget into 3 equal parts:
+                        # fp for z-value, fp1 for variance bound, fp2 for mean bound
+                        delta = fp / 3
                         final_sample_size = get_mean_sample_size(
-                            error, fp, fp, fp, sample_mean, sample_std, sample_size
+                            error, delta, delta, delta, sample_mean, sample_std, sample_size
                         )
                         final_sample_rate = get_sample_rate(
                             fp, final_sample_size, pilot_rate, sample_size
@@ -190,8 +196,10 @@ def estimate_final_rate(
                     sample_mean = df[col].iloc[0]
                     sample_std = df[col].iloc[1]
                     sample_size = df[col].iloc[2]
+                    # [FIX B4] Paper Procedure 1: δ₁=δ₂=(1-p)/3
+                    delta = fp / 3
                     final_sample_size = get_mean_sample_size(
-                        error, fp, fp, fp, sample_mean, sample_std, sample_size
+                        error, delta, delta, delta, sample_mean, sample_std, sample_size
                     )
                     final_sample_rate = get_sample_rate(
                         fp, final_sample_size, pilot_rate, sample_size

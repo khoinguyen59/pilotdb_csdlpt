@@ -78,6 +78,46 @@ def aggregate_error_to_page_error(
                 )
             else:
                 page_errors[aggregate[SECOND_ELEMENT]] = page_required_error
+
+        # [FIX B1] MUL_OPERATOR: Paper Table 2, Multiplication row
+        # e_product <= e1 + e2 + e1*e2, equal allocation => e' = sqrt(e+1) - 1
+        elif aggregate["aggregate"] == MUL_OPERATOR:
+            page_required_error = min(
+                1 - math.sqrt(1 - required_error),
+                math.sqrt(required_error + 1) - 1,
+            )
+            if aggregate[FIRST_ELEMENT] in page_errors:
+                page_errors[aggregate[FIRST_ELEMENT]] = min(
+                    page_errors[aggregate[FIRST_ELEMENT]], page_required_error
+                )
+            else:
+                page_errors[aggregate[FIRST_ELEMENT]] = page_required_error
+
+            if aggregate[SECOND_ELEMENT] in page_errors:
+                page_errors[aggregate[SECOND_ELEMENT]] = min(
+                    page_errors[aggregate[SECOND_ELEMENT]], page_required_error
+                )
+            else:
+                page_errors[aggregate[SECOND_ELEMENT]] = page_required_error
+
+        # [FIX B2] SUB_OPERATOR: Paper Table 2, Addition row
+        # e_sum <= max(e1, e2), equal allocation => e' = required_error
+        elif aggregate["aggregate"] == SUB_OPERATOR:
+            page_required_error = required_error
+            if aggregate[FIRST_ELEMENT] in page_errors:
+                page_errors[aggregate[FIRST_ELEMENT]] = min(
+                    page_errors[aggregate[FIRST_ELEMENT]], page_required_error
+                )
+            else:
+                page_errors[aggregate[FIRST_ELEMENT]] = page_required_error
+
+            if aggregate[SECOND_ELEMENT] in page_errors:
+                page_errors[aggregate[SECOND_ELEMENT]] = min(
+                    page_errors[aggregate[SECOND_ELEMENT]], page_required_error
+                )
+            else:
+                page_errors[aggregate[SECOND_ELEMENT]] = page_required_error
+
         else:
             raise NotImplemented(
                 f"operator {aggregate['aggregate']} is not implemented"
@@ -149,6 +189,44 @@ def aggregate_error_uniform(column_mapping: List[Dict], required_error: float = 
                 )
             else:
                 errors[aggregate[SECOND_ELEMENT]] = page_required_error
+
+        # [FIX B1] MUL_OPERATOR: Paper Table 2, Multiplication row
+        elif aggregate["aggregate"] == MUL_OPERATOR:
+            page_required_error = min(
+                1 - math.sqrt(1 - required_error),
+                math.sqrt(required_error + 1) - 1,
+            )
+            if aggregate[FIRST_ELEMENT] in errors:
+                errors[aggregate[FIRST_ELEMENT]] = min(
+                    errors[aggregate[FIRST_ELEMENT]], page_required_error
+                )
+            else:
+                errors[aggregate[FIRST_ELEMENT]] = page_required_error
+
+            if aggregate[SECOND_ELEMENT] in errors:
+                errors[aggregate[SECOND_ELEMENT]] = min(
+                    errors[aggregate[SECOND_ELEMENT]], page_required_error
+                )
+            else:
+                errors[aggregate[SECOND_ELEMENT]] = page_required_error
+
+        # [FIX B2] SUB_OPERATOR: Paper Table 2, Addition row
+        elif aggregate["aggregate"] == SUB_OPERATOR:
+            page_required_error = required_error
+            if aggregate[FIRST_ELEMENT] in errors:
+                errors[aggregate[FIRST_ELEMENT]] = min(
+                    errors[aggregate[FIRST_ELEMENT]], page_required_error
+                )
+            else:
+                errors[aggregate[FIRST_ELEMENT]] = page_required_error
+
+            if aggregate[SECOND_ELEMENT] in errors:
+                errors[aggregate[SECOND_ELEMENT]] = min(
+                    errors[aggregate[SECOND_ELEMENT]], page_required_error
+                )
+            else:
+                errors[aggregate[SECOND_ELEMENT]] = page_required_error
+
         else:
             raise NotImplemented(
                 f"operator {aggregate['aggregate']} is not implemented"
