@@ -5,6 +5,7 @@ import pandas as pd
 import pilotdb.db_driver.duckdb_utils as duckdb_utils
 import pilotdb.db_driver.postgres_utils as postgres_utils
 import pilotdb.db_driver.sqlserver_utils as sqlserver_utils
+from pilotdb.db_driver.cost import estimate_query_cost, should_run_exact
 
 
 def connect_to_db(dbms: str, config: dict):
@@ -14,15 +15,21 @@ def connect_to_db(dbms: str, config: dict):
         return duckdb_utils.connect_to_db(config["path"])
     elif dbms == "postgres":
         return postgres_utils.connect_to_db(
-            config["dbname"],
-            config["username"],
-            config["host"],
-            config["port"],
-            config["password"],
+            db=config["dbname"],
+            user=config["username"],
+            host=config.get("host", "localhost"),
+            port=int(config.get("port", 5432)),
+            password=config.get("password") or None,
         )
     elif dbms == "sqlserver":
         return sqlserver_utils.connect_to_db(
-            config["dbname"], config["username"], config["host"], config["password"]
+            db=config.get("dbname"),
+            user=config.get("username"),
+            host=config.get("host", "127.0.0.1"),
+            password=config.get("password"),
+            trusted_connection=bool(config.get("trusted_connection", False)),
+            driver=config.get("driver", "ODBC Driver 18 for SQL Server"),
+            flush_memory=bool(config.get("flush_memory", False)),
         )
     else:
         raise ValueError(f"Unknown DBMS: {dbms}")
@@ -70,6 +77,12 @@ def get_uniform_sampling_clause(rate: float, dbms: str) -> str | None:
         return f"{rate / 100}"
     else:
         ValueError(f"Unknown DBMS: {dbms}")
+
+
+def estimate_cost(conn, query: str, dbms: str, table_size=None, sampling_plan=None) -> float:
+    return estimate_query_cost(
+        conn, query, dbms, table_size=table_size, sampling_plan=sampling_plan
+    )
 
 
 def directly_run_exact(

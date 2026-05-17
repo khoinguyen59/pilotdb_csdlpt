@@ -24,15 +24,15 @@ def execute_query(conn, query: str) -> pd.DataFrame:
     return sqlio.read_sql_query(query, conn)
 
 
-def is_high_estimated_cost(conn, query: str, pilot_query: str):
+def estimate_cost(conn, query: str) -> float:
     cur = conn.cursor()
-    exact_query = f"EXPLAIN (FORMAT JSON) {query}"
-    cur.execute(exact_query)
-    estimated_exact_cost = cur.fetchone()[0][0]["Plan"]["Total Cost"]
+    cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+    return float(cur.fetchone()[0][0]["Plan"]["Total Cost"])
 
-    aqp_query = f"EXPLAIN (FORMAT JSON) {pilot_query}"
-    cur.execute(aqp_query)
-    estimated_aqp_cost = cur.fetchone()[0][0]["Plan"]["Total Cost"]
+
+def is_high_estimated_cost(conn, query: str, pilot_query: str):
+    estimated_exact_cost = estimate_cost(conn, query)
+    estimated_aqp_cost = estimate_cost(conn, pilot_query)
     print(estimated_aqp_cost / estimated_exact_cost)
     if estimated_aqp_cost / estimated_exact_cost > 0.05:
         return True

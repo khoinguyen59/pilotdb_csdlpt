@@ -1,0 +1,26 @@
+{
+    "duckdb": {
+        "dbms": "duckdb",
+        "database": "./benchmarks/duckdb/tpch.duckdb",
+        "host": "",
+        "port": "",
+        "user": "",
+        "password": ""
+    },
+    "postgres": {
+        "dbms": "postgres",
+        "database": "tpch",
+        "host": "localhost",
+        "port": "5432",
+        "user": "pilotdb",
+        "password": "pilotdb"
+    },
+    "sqlserver": {
+        "dbms": "sqlserver",
+        "database": "tpch",
+        "host": "localhost",
+        "port": "1433",
+        "user": "sa",
+        "password": "YourStrongPassword!"
+    }
+}

@@ -1,0 +1,15 @@
+# Local SQL Server config for PilotDB E2E tests.
+# Overridable env vars:
+#   PILOTDB_MSSQL_HOST, PILOTDB_MSSQL_DBNAME, PILOTDB_MSSQL_USER,
+#   PILOTDB_MSSQL_PASSWORD, PILOTDB_MSSQL_TRUSTED, PILOTDB_MSSQL_DRIVER
+#
+# Default uses Windows Trusted Connection against a local instance.
+# For a docker-compose SQL Server, switch to sa/<password> below.
+dbname: pilotdb_tpch
+host: localhost,1433
+trusted_connection: true
+driver: ODBC Driver 18 for SQL Server
+flush_memory: false
+# Uncomment + comment trusted_connection if using SQL Auth:
+# username: sa
+# password: <set me>

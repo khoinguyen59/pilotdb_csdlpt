@@ -8,12 +8,40 @@ import pyodbc
 
 
 def connect_to_db(
-    db: str, user: str, host: str = "127.0.0.1", password: str | None = None
+    db: str,
+    user: str | None,
+    host: str = "127.0.0.1",
+    password: str | None = None,
+    trusted_connection: bool = False,
+    driver: str = "ODBC Driver 18 for SQL Server",
+    flush_memory: bool = True,
 ):
-    conn_string = f"DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={host};DATABASE={db};UID={user};PWD={password};TrustServerCertificate=yes;"
+    """Connect to SQL Server via pyodbc.
+
+    Supports either SQL Authentication (UID/PWD) or Windows Trusted
+    Connection. Passing `trusted_connection=True` ignores `user`/`password`.
+
+    `flush_memory=False` skips the DBCC cache flushes — useful when the
+    connecting principal lacks sysadmin (e.g. a constrained loader login).
+    """
+    parts = [f"DRIVER={{{driver}}}", f"SERVER={host}"]
+    if db:
+        parts.append(f"DATABASE={db}")
+    if trusted_connection:
+        parts.append("Trusted_Connection=yes")
+    else:
+        parts.append(f"UID={user}")
+        parts.append(f"PWD={password if password is not None else ''}")
+    parts.append("TrustServerCertificate=yes")
+    conn_string = ";".join(parts) + ";"
     conn = pyodbc.connect(conn_string)
-    conn.execute("DBCC FREEPROCCACHE;")
-    conn.execute("DBCC DROPCLEANBUFFERS;")
+    if flush_memory:
+        try:
+            conn.execute("DBCC FREEPROCCACHE;")
+            conn.execute("DBCC DROPCLEANBUFFERS;")
+        except pyodbc.Error:
+            # Insufficient privilege — proceed without flush.
+            pass
     return conn
 
 
@@ -55,3 +83,26 @@ def is_index_seek(conn, query: str, largest_table: str):
                     return True
 
         return False
+
+
+def estimate_cost(conn, query: str) -> float:
+    with conn.cursor() as cursor:
+        cursor.execute("SET SHOWPLAN_XML ON;")
+        cursor.commit()
+        try:
+            cursor.execute(query)
+            plan = cursor.fetchone()
+        finally:
+            cursor.execute("SET SHOWPLAN_XML OFF;")
+            cursor.commit()
+
+    root = ET.fromstring(plan[0])
+    namespaces = {"sql": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
+    costs = []
+    for node in root.findall(".//sql:RelOp", namespaces):
+        cost = node.get("EstimatedTotalSubtreeCost")
+        if cost is not None:
+            costs.append(float(cost))
+    if not costs:
+        raise ValueError("SQL Server showplan did not expose estimated costs")
+    return max(costs)

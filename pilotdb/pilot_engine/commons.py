@@ -1,6 +1,7 @@
 AVG_OPERATOR = "avg"
 SUM_OPERATOR = "sum"
 COUNT_OPERATOR = "count"
+COUNT_DISTINCT_OPERATOR = "count_distinct"
 SUB_OPERATOR = "sub"
 DIV_OPERATOR = "div"
 MUL_OPERATOR = "mul"

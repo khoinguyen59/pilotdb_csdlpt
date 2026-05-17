@@ -119,7 +119,7 @@ def aggregate_error_to_page_error(
                 page_errors[aggregate[SECOND_ELEMENT]] = page_required_error
 
         else:
-            raise NotImplemented(
+            raise NotImplementedError(
                 f"operator {aggregate['aggregate']} is not implemented"
             )
 
@@ -228,7 +228,7 @@ def aggregate_error_uniform(column_mapping: List[Dict], required_error: float = 
                 errors[aggregate[SECOND_ELEMENT]] = page_required_error
 
         else:
-            raise NotImplemented(
+            raise NotImplementedError(
                 f"operator {aggregate['aggregate']} is not implemented"
             )
     return errors

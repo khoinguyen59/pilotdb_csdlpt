@@ -1,0 +1,11 @@
+# Local Postgres config for PilotDB E2E tests.
+# Override per-host via env vars:
+#   PILOTDB_PG_HOST, PILOTDB_PG_PORT, PILOTDB_PG_USER,
+#   PILOTDB_PG_PASSWORD, PILOTDB_PG_DBNAME
+#
+# Defaults below match the docker-compose service in dockerfile/compose.yml.
+dbname: tpch
+username: pilotdb
+host: localhost
+port: 5432
+password: pilotdb

@@ -24,3 +24,10 @@ dev = [
 
 [tool.uv.sources]
 pilotdb = { workspace = true }
+
+[tool.pytest.ini_options]
+markers = [
+    "postgres: requires a reachable PostgreSQL instance (env PILOTDB_PG_HOST or db_configs/postgres_local.yml).",
+    "sqlserver: requires a reachable SQL Server instance (env PILOTDB_MSSQL_HOST or db_configs/sqlserver_local.yml).",
+    "slow: marks tests as slow (>10s).",
+]

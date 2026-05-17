@@ -5,6 +5,12 @@ import sqlglot
 from sqlglot import exp
 
 from pilotdb.pilot_engine.commons import *
+from pilotdb.pilot_engine.multi_table_sampling import sampling_placeholder
+
+
+def _get_from(expression):
+    """Compatibility helper: sqlglot >=26 renamed 'from' → 'from_'."""
+    return expression.args.get("from_") or expression.args.get("from")
 
 
 class Pilot_Rewriter:
@@ -20,8 +26,10 @@ class Pilot_Rewriter:
         self.table_alias = {}
         self.cte = {}
         self.is_rewritable = True
+        self.unsupported_reason = None
         self.contains_agg = {}
         self.largest_table = None
+        self.sampled_tables = []
         self.single_sample = False
         self.sampled_cte = set()
         self.select_expression_count = 0
@@ -289,8 +297,13 @@ class Pilot_Rewriter:
                     result_mapping[AGGREGATE] = SUM_OPERATOR
                     result_mapping[PAGE_SUM] = f"r{self.select_expression_count-1}"
                 elif select_expression.find(exp.Count):
-                    result_mapping[AGGREGATE] = COUNT_OPERATOR
-                    result_mapping[PAGE_SIZE] = f"r{self.select_expression_count-1}"
+                    count_node = select_expression.find(exp.Count)
+                    if count_node and count_node.args.get("distinct"):
+                        result_mapping[AGGREGATE] = COUNT_DISTINCT_OPERATOR
+                        result_mapping[PAGE_SIZE] = f"r{self.select_expression_count-1}"
+                    else:
+                        result_mapping[AGGREGATE] = COUNT_OPERATOR
+                        result_mapping[PAGE_SIZE] = f"r{self.select_expression_count-1}"
                 elif select_expression.find(exp.Anonymous):
                     if (
                         select_expression.find(exp.Anonymous).this.upper()
@@ -401,7 +414,7 @@ class Pilot_Rewriter:
 
     def find_all_tables(self, expression):
         table_list = []
-        for table in expression.args["from"].find_all(exp.Table):
+        for table in _get_from(expression).find_all(exp.Table):
             table_list.append(table)
         if "joins" in expression.args:
             for join in expression.args["joins"]:
@@ -410,7 +423,7 @@ class Pilot_Rewriter:
 
     def add_table_sample(self, expression):
         tablesample = (
-            sqlglot.parse_one("from lineitem TABLESAMPLE SYSTEM (1)").args["from"].this
+            _get_from(sqlglot.parse_one("from lineitem TABLESAMPLE SYSTEM (1)")).this
         )
         table_list = {
             table.this.this: table for table in self.find_all_tables(expression)
@@ -426,10 +439,10 @@ class Pilot_Rewriter:
                     self.largest_table = largest_table
                 break
 
-        for table in expression.args["from"].find_all(exp.Table):
+        for table in _get_from(expression).find_all(exp.Table):
             if table.this.this == self.largest_table:
                 tablesample.set("this", table)
-                expression.args["from"].set("this", tablesample)
+                _get_from(expression).set("this", tablesample)
                 return expression
         if "joins" in expression.args:
             for join in expression.args["joins"]:
@@ -545,15 +558,15 @@ class Pilot_Rewriter:
         if contains_agg:
             for i in range(level):
                 if self.contains_agg[i]:
-                    self.is_rewritable = False
+                    self.mark_unrewritable("nested aggregate query is not supported")
             self.contains_agg[level] = True
         elif level not in self.contains_agg:
             self.contains_agg[level] = False
         if expression.find(exp.Union):
             is_union = True
-        if expression.args["from"].find(exp.Subquery):
-            if expression.args["from"].find(exp.Union):
-                for select_query in expression.args["from"].find_all(
+        if _get_from(expression).find(exp.Subquery):
+            if _get_from(expression).find(exp.Union):
+                for select_query in _get_from(expression).find_all(
                     exp.Select, bfs=False
                 ):
                     is_in_where = False
@@ -566,7 +579,7 @@ class Pilot_Rewriter:
                     if not is_in_where:
                         self.primary_query_rewriter(select_query, is_union, level + 1)
             else:
-                select_query = expression.args["from"].find(exp.Select)
+                select_query = _get_from(expression).find(exp.Select)
                 self.primary_query_rewriter(select_query, is_union, level + 1)
             if "joins" in expression.args:
                 for join_expression in expression.args["joins"]:
@@ -590,11 +603,11 @@ class Pilot_Rewriter:
             elif not is_star:
                 self.add_page_id(expression, add_group_by=False, page_id=False)
 
-        elif self.cte and expression.args["from"].this.this.this in self.cte:
-            cte_expression = self.cte[expression.args["from"].this.this.this]
-            if expression.args["from"].this.this.this not in self.sampled_cte:
+        elif self.cte and _get_from(expression).this.this.this in self.cte:
+            cte_expression = self.cte[_get_from(expression).this.this.this]
+            if _get_from(expression).this.this.this not in self.sampled_cte:
                 self.primary_query_rewriter(cte_expression, is_union, level + 1)
-                self.sampled_cte.add(expression.args["from"].this.this.this)
+                self.sampled_cte.add(_get_from(expression).this.this.this)
 
             if not self.single_sample:
                 if "joins" in expression.args:
@@ -629,7 +642,7 @@ class Pilot_Rewriter:
 
     def remove_cte(self, expression):
         remove_cte = True
-        for table in expression.args["from"].find_all(exp.Table):
+        for table in _get_from(expression).find_all(exp.Table):
             if table.this.this in self.cte:
                 remove_cte = False
                 break
@@ -645,9 +658,10 @@ class Pilot_Rewriter:
             expression.set("with", None)
 
     def replace_sample_method(self, sql_query):
-        new_query = sql_query.replace(
-            "TABLESAMPLE SYSTEM (1 ROWS)", "{sampling_method}"
-        )
+        placeholder = "{sampling_method}"
+        if self.largest_table:
+            placeholder = sampling_placeholder(self.largest_table)
+        new_query = sql_query.replace("TABLESAMPLE SYSTEM (1 ROWS)", placeholder)
         return new_query
 
     def remove_duplicate(self, expression):
@@ -722,6 +736,26 @@ class Pilot_Rewriter:
 
                 group_by.set(group_arg, new_group_by)
 
+    def mark_unrewritable(self, reason):
+        self.is_rewritable = False
+        self.unsupported_reason = reason
+
+    def validate_supported_query(self, expression):
+        """Paper ?2.3 fallback policy for unsupported aggregates."""
+        if expression.find(exp.Max):
+            self.mark_unrewritable("MAX aggregate is not supported by TAQA")
+            return False
+        if expression.find(exp.Min):
+            self.mark_unrewritable("MIN aggregate is not supported by TAQA")
+            return False
+        for count_node in expression.find_all(exp.Count):
+            if count_node.args.get("distinct") or isinstance(
+                count_node.this, exp.Distinct
+            ):
+                self.mark_unrewritable("COUNT DISTINCT is not supported by TAQA")
+                return False
+        return True
+
     def rewrite(self, original_query):
         if self.database == SQLSERVER:
             match = re.search(r"TOP (\d+)", original_query, re.IGNORECASE)
@@ -731,10 +765,12 @@ class Pilot_Rewriter:
                     r"TOP \d+", "", original_query, flags=re.IGNORECASE
                 )
         expression = sqlglot.parse_one(original_query)
+        if not self.validate_supported_query(expression):
+            return original_query
         # Simple count query in duckdb
         if self.database == DUCKDB:
             if not expression.find(exp.Column):
-                self.is_rewritable = False
+                self.mark_unrewritable("DuckDB simple count query without columns")
                 return original_query
 
         self.find_alias(expression)
@@ -769,3 +805,4 @@ class Pilot_Rewriter:
         logging.info(f"res2pageid: {self.res_2_page_id}")
         logging.info(f"subqueries in WHERE and HAVING: {self.subquery_dict}")
         logging.info(f"limit value: {self.limit_value}")
+        logging.info(f"unsupported reason: {self.unsupported_reason}")

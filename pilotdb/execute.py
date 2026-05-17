@@ -2,11 +2,13 @@ import importlib.util
 import json
 import logging
 import math
+import re
 import sys
 import time
 from typing import Dict
 import warnings
 
+import numpy as np
 import pandas as pd
 from sqlglot import transpile
 
@@ -18,11 +20,26 @@ from pilotdb.pilot_engine.error_bounds import (
     estimate_final_rate_uniform,
 )
 from pilotdb.pilot_engine.rewriter.pilot import Pilot_Rewriter
+from pilotdb.pilot_engine.optimizer import (
+    build_optimization_context,
+    generate_candidate_plans,
+)
+from pilotdb.pilot_engine.sampling_plan import scalar_rate_plan, choose_lowest_cost_plan
+from pilotdb.pilot_engine.multi_table_sampling import (
+    apply_sampling_plan_template,
+    sampled_rate_for_output,
+)
 from pilotdb.pilot_engine.rewriter.sampling import Sampling_Rewriter
 from pilotdb.pilot_engine.utils import (
     aggregate_error_to_page_error,
     aggregate_error_uniform,
 )
+from pilotdb.pilot_engine.join_variance import (
+    build_phi_constraints,
+    JoinBlockStats,
+    PhiConstraintSet,
+)
+from pilotdb.pilot_engine.aqp_guarantee import check_guarantee_mode
 from pilotdb.query import *
 from pilotdb.utils.path import *
 from pilotdb.utils.timer import Timer
@@ -30,6 +47,391 @@ from pilotdb.utils.utils import dump_results, get_largest_sample_rate, setup_log
 
 
 warnings.simplefilter(action="ignore", category=UserWarning)
+
+
+# ---- Phase 3: top-level wrap + residual subquery-placeholder guard ----
+#
+# Pilot / sampling SQL produced by `Pilot_Rewriter.rewrite` may carry
+# `subquery_<N>` tokens until `process_subqueries` substitutes them with
+# scalar results. If a token survives substitution (e.g. Q18 on SQL
+# Server, where the rewriter encodes a multi-row IN-subquery as a single
+# placeholder that the dialect parser then rejects), the rewritten SQL
+# is unsafe to issue. We detect that explicitly and route to an exact
+# fallback rather than letting the DBMS produce an opaque parse error.
+_RESIDUAL_PLACEHOLDER_PAT = re.compile(r"\bsubquery_\d+\b")
+
+
+class _UnrewritableError(Exception):
+    """Internal control signal: a rewriter-unsafe construct was detected
+    after rewriting completed. Caught by :func:`execute_aqp` and converted
+    into a structured ``not_rewritable:<reason>`` exact-fallback.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _check_residual_subquery_placeholder(rewritten_sql: str, pq) -> None:
+    """If a ``subquery_<N>`` token survived substitution, mark the
+    rewriter unsafe and raise :class:`_UnrewritableError` so the wrap
+    converts the call into an exact fallback. Also flips
+    ``pq.is_rewritable`` and ``pq.unsupported_reason`` for diagnostics.
+    """
+    if _RESIDUAL_PLACEHOLDER_PAT.search(rewritten_sql):
+        try:
+            pq.is_rewritable = False
+            pq.unsupported_reason = "subquery_placeholder"
+        except Exception:
+            pass
+        logging.info(
+            "[Phase 3 guard] residual subquery placeholder in rewritten SQL; "
+            "marking unrewritable and exact-falling back."
+        )
+        raise _UnrewritableError("subquery_placeholder")
+
+
+def _exact_fallback_for_query(
+    query,
+    db_config: dict,
+    *,
+    reason: str,
+    cause: "Exception | None" = None,
+    conn=None,
+) -> "tuple[pd.DataFrame, dict]":
+    """Run ``query.query`` exactly and return ``(df, timing)`` matching
+    the :func:`execute_aqp` shape. The returned timing dict always
+    satisfies Requirement 8.2 (``pilot_sample_rate``,
+    ``final_sample_rate``, ``fallback_reason``). Used by the top-level
+    wrap in :func:`execute_aqp` and by the explicit-fallback path for
+    rewriter-unsafe constructs.
+    """
+    dbms = db_config["dbms"]
+    timer = Timer()
+    timer.start()
+    own_conn = False
+    try:
+        if conn is None:
+            conn = connect_to_db(dbms, db_config)
+            own_conn = True
+        try:
+            df = execute_query(conn, query.query, dbms)
+            timer.check("exact_query_execution")
+        finally:
+            timer.stop()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                close_connection(conn, dbms)
+            except Exception:  # noqa: BLE001
+                pass
+    timing = timer.get_records()
+    timing["pilot_sample_rate"] = None
+    timing["final_sample_rate"] = 1
+    timing["fallback_reason"] = reason
+    if cause is not None:
+        timing["fallback_cause"] = f"{type(cause).__name__}: {cause}"
+    return df, timing
+
+
+def _extract_pilot_stats(
+    pilot_results: pd.DataFrame,
+    page_errors: dict,
+    group_cols: list,
+    limit: int | None = None,
+    join_block_stats: JoinBlockStats | None = None,
+) -> list[dict]:
+    """Extract per-(aggregate, group) statistics from pilot results.
+
+    Bridges the gap between the pilot DataFrame and build_phi_constraints().
+    Returns a list of dicts with keys: sample_mean, sample_std, sample_size,
+    aggregate_index, group_index, and optionally 'join_stats'.
+    """
+    page_stats_cols = [col for col in page_errors.keys() if col != "n_page"]
+    keep_columns = group_cols + page_stats_cols
+    pilot_df = pilot_results[keep_columns]
+
+    if len(group_cols) > 0:
+        if limit is not None:
+            df = (
+                pilot_df.groupby(by=group_cols, sort=False)
+                .agg(["mean", "std", "size"])
+                .head(limit)
+            )
+        else:
+            df = pilot_df.groupby(by=group_cols, sort=False).agg(
+                ["mean", "std", "size"]
+            )
+    else:
+        df = pilot_df.agg(["mean", "std", "size"])
+
+    n_groups = df.shape[0] if len(group_cols) > 0 else 1
+    stats = []
+    agg_idx = 0
+    for col in page_stats_cols:
+        for grp in range(n_groups):
+            if len(group_cols) > 0:
+                s_mean = float(df[(col, "mean")].iloc[grp])
+                s_std = float(df[(col, "std")].iloc[grp])
+                s_size = int(df[(col, "size")].iloc[grp])
+            else:
+                s_mean = float(df[col].iloc[0])
+                s_std = float(df[col].iloc[1])
+                s_size = int(df[col].iloc[2])
+            # Replace NaN std with 0 (happens with single-block groups)
+            if not math.isfinite(s_std):
+                s_std = 0.0
+            stat_entry = {
+                "sample_mean": s_mean,
+                "sample_std": s_std,
+                "sample_size": s_size,
+                "aggregate_index": agg_idx,
+                "group_index": grp,
+            }
+            # Attach real join block stats if available (Lemma 4.8)
+            if join_block_stats is not None:
+                stat_entry["join_stats"] = join_block_stats
+            stats.append(stat_entry)
+        agg_idx += 1
+    return stats
+
+
+def _extract_join_block_stats(
+    pilot_results: pd.DataFrame,
+    page_errors: dict,
+    page_id_count: int,
+    table_sizes: dict,
+    block_size: int = 8192,
+) -> JoinBlockStats | None:
+    """Extract real JoinBlockStats (y1/y2/y3/N2) from pilot query results.
+
+    For two-table join queries, the pilot query produces:
+      - page_id_0: block ID from the sampled table (T1)
+      - page_id_1: block ID from the second table (T2)
+
+    We group by these to reconstruct:
+      y(1)_i = (Σ J(t_{1,i}, t_{2,*}))^2  — per T1-block
+      y(2)_{i2,i} = J(t_{1,i}, t_{2,i2})   — per (T1-block, T2-block) pair
+      y(3)_i = Σ J(t_{1,i}, t_{2,*})^2     — per T1-block
+
+    Returns None if pilot results don't have multi-table page_id columns.
+    """
+    # Need at least 2 page_id columns for join stats
+    if page_id_count < 2:
+        return None
+
+    pid_col_0 = "page_id_0"  # T1 block
+    pid_col_1 = "page_id_1"  # T2 block
+    if pid_col_0 not in pilot_results.columns or pid_col_1 not in pilot_results.columns:
+        logging.info(
+            "[JoinBlockStats] page_id_0/page_id_1 not found in pilot results; "
+            "columns available: %s",
+            list(pilot_results.columns),
+        )
+        return None
+
+    # Pick the first aggregate column as the join value J(t1, t2)
+    page_stats_cols = [col for col in page_errors.keys() if col != "n_page"]
+    if not page_stats_cols:
+        return None
+    agg_col = page_stats_cols[0]
+    if agg_col not in pilot_results.columns:
+        return None
+
+    try:
+        # Parse block IDs from 'page_id_N:XXXX' format
+        def parse_block_id(val):
+            if isinstance(val, str) and ":" in val:
+                return val.split(":", 1)[1].strip()
+            return str(val)
+
+        df = pilot_results.copy()
+        df["_bid_t1"] = df[pid_col_0].apply(parse_block_id)
+        df["_bid_t2"] = df[pid_col_1].apply(parse_block_id)
+
+        # y(2): per (T1-block, T2-block) pair sums
+        pair_sums = df.groupby(["_bid_t1", "_bid_t2"])[agg_col].sum()
+        y2_values = pair_sums.values.astype(float)
+
+        # y(1): per T1-block, sum across all T2 blocks, then square
+        t1_sums = df.groupby("_bid_t1")[agg_col].sum()
+        y1_per_block = (t1_sums.values ** 2).astype(float)
+
+        # y(3): per T1-block, sum of squared per-T2-block join results
+        pair_sq = pair_sums ** 2
+        y3_per_block = pair_sq.groupby(level=0).sum().values.astype(float)
+
+        # N2: estimate total blocks in T2
+        n_unique_t2 = df["_bid_t2"].nunique()
+        # Use table_sizes to get better N2 estimate
+        table_names = list(table_sizes.keys())
+        if len(table_names) >= 2:
+            # Second table in table_sizes (T2)
+            t2_size = table_sizes.get(table_names[1], 0)
+            N2 = max(math.ceil(t2_size / block_size), n_unique_t2, 1)
+        else:
+            N2 = max(n_unique_t2, 1)
+
+        n_pilot_blocks = len(y1_per_block)
+        pilot_rate = n_pilot_blocks / max(
+            math.ceil(table_sizes.get(table_names[0], n_pilot_blocks) / block_size),
+            1,
+        ) if table_names else 0.05
+
+        join_stats = JoinBlockStats(
+            y1_per_block=y1_per_block,
+            y2_values=y2_values,
+            y3_per_block=y3_per_block,
+            n_pilot_blocks=n_pilot_blocks,
+            N2=N2,
+            pilot_rate=pilot_rate,
+        )
+        logging.info(
+            "[JoinBlockStats] Extracted: n_pilot_blocks=%d, N2=%d, "
+            "y2_pairs=%d, pilot_rate=%.4f",
+            n_pilot_blocks, N2, len(y2_values), pilot_rate,
+        )
+        return join_stats
+
+    except Exception as e:
+        logging.warning(
+            "[JoinBlockStats] Failed to extract from pilot results: %s", e
+        )
+        return None
+
+
+def _extract_user_aliases(original_sql: str) -> list[str]:
+    """Parse SELECT projection aliases positionally from the user SQL.
+
+    Returns a list of strings in the order projected by SELECT. Aliases
+    that are explicit (`x AS y`) yield `y`; plain column refs yield the
+    column name; everything else yields `col_<i>`. Empty list on parse
+    failure or missing SELECT.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+        parsed = sqlglot.parse_one(original_sql)
+    except Exception:
+        return []
+    if parsed is None:
+        return []
+    select = parsed.find(exp.Select)
+    if select is None:
+        return []
+    out: list[str] = []
+    for i, proj in enumerate(select.args.get("expressions", []) or []):
+        if isinstance(proj, exp.Alias):
+            out.append(proj.alias)
+        elif isinstance(proj, exp.Column):
+            out.append(proj.this.this if hasattr(proj.this, "this") else str(proj.this))
+        else:
+            out.append(f"col_{i}")
+    return out
+
+
+def _translate_pilot_results(
+    pilot_results: pd.DataFrame,
+    pq,
+    pilot_sample_rate: float,
+    user_aliases: list[str] | None = None,
+) -> pd.DataFrame:
+    """Translate pilot block-level results into the final user-facing answer.
+
+    Paper §3.3: when final_sample_rate <= pilot_sample_rate the pilot
+    sample is already statistically sufficient. Instead of re-executing
+    a sampling query we (a) drop block-id helper columns, (b) aggregate
+    over blocks, (c) upscale SUM-like aggregates by 1/θ, and (d) map
+    the rewriter's r{N} columns back to the user's SELECT aliases.
+
+    Per-aggregate handling follows the operator kind in
+    `pq.result_mapping_list[i][AGGREGATE]`:
+      - SUM:   Σ(page_sum) / θ
+      - COUNT: Σ(page_size) / θ
+      - AVG:   Σ(page_sum) / Σ(page_size)        (ratio cancels θ)
+      - MUL:   (Σ(first)/θ) × (Σ(second)/θ)
+      - DIV:   (Σ(first)/θ) / (Σ(second)/θ)      (ratio cancels θ)
+      - SUB:   (Σ(first) - Σ(second)) / θ
+    """
+    rate = pilot_sample_rate / 100.0
+    if rate <= 0:
+        raise ValueError(f"invalid pilot_sample_rate={pilot_sample_rate}")
+
+    df = pilot_results.copy()
+    # Drop block-id helper columns (page_id_0, page_id_1, ...)
+    page_id_cols = [c for c in df.columns if str(c).startswith("page_id_")]
+    if page_id_cols:
+        df = df.drop(columns=page_id_cols, errors="ignore")
+
+    n_group = len(pq.group_cols) if pq.group_cols else 0
+    n_agg = len(pq.result_mapping_list) if pq.result_mapping_list else 0
+    if user_aliases is None or len(user_aliases) != n_group + n_agg:
+        user_aliases = (
+            list(pq.group_cols or [])
+            + [f"agg_{i}" for i in range(n_agg)]
+        )
+
+    if pq.group_cols:
+        grouped = (
+            df.groupby(list(pq.group_cols), sort=False, as_index=False)
+              .sum(numeric_only=True)
+        )
+    else:
+        agg_row = df.sum(numeric_only=True)
+        grouped = pd.DataFrame([agg_row])
+
+    out = pd.DataFrame()
+    # Carry through grouping columns under user-facing names
+    for i, gc in enumerate(pq.group_cols or []):
+        if gc in grouped.columns:
+            out[user_aliases[i]] = grouped[gc].values
+
+    # Compute each aggregate value
+    for j, mapping in enumerate(pq.result_mapping_list or []):
+        alias = user_aliases[n_group + j]
+        kind = mapping.get(AGGREGATE)
+        if kind == SUM_OPERATOR:
+            col = mapping[PAGE_SUM]
+            out[alias] = grouped[col].astype(float).values / rate
+        elif kind == COUNT_OPERATOR:
+            col = mapping[PAGE_SIZE]
+            out[alias] = grouped[col].astype(float).values / rate
+        elif kind == AVG_OPERATOR:
+            num = grouped[mapping[PAGE_SUM]].astype(float).values
+            den = grouped[mapping[PAGE_SIZE]].astype(float).values
+            out[alias] = np.where(den != 0, num / np.where(den == 0, 1, den), 0.0)
+        elif kind == MUL_OPERATOR:
+            a = grouped[mapping[FIRST_ELEMENT]].astype(float).values / rate
+            b = grouped[mapping[SECOND_ELEMENT]].astype(float).values / rate
+            out[alias] = a * b
+        elif kind == DIV_OPERATOR:
+            num = grouped[mapping[FIRST_ELEMENT]].astype(float).values / rate
+            den = grouped[mapping[SECOND_ELEMENT]].astype(float).values / rate
+            out[alias] = np.where(den != 0, num / np.where(den == 0, 1, den), 0.0)
+        elif kind == SUB_OPERATOR:
+            a = grouped[mapping[FIRST_ELEMENT]].astype(float).values
+            b = grouped[mapping[SECOND_ELEMENT]].astype(float).values
+            out[alias] = (a - b) / rate
+        elif kind == COUNT_DISTINCT_OPERATOR:
+            # COUNT(DISTINCT x) cannot be unbiasedly upscaled from a
+            # block sample. Return the pilot-observed distinct count
+            # as a lower-bound proxy and log it.
+            col = mapping.get(PAGE_SUM) or mapping.get(PAGE_SIZE)
+            logging.warning(
+                "[direct-translate] COUNT(DISTINCT) on sample is a proxy "
+                "(pilot-observed lower bound)."
+            )
+            out[alias] = grouped[col].astype(float).values if col else 0.0
+        else:
+            raise NotImplementedError(
+                f"_translate_pilot_results: unsupported aggregate kind={kind!r}"
+            )
+
+    logging.info(
+        "[direct-translate] pilot_rate=%.4f%% (θ=%.4f); out_shape=%s cols=%s",
+        pilot_sample_rate, rate, out.shape, list(out.columns),
+    )
+    return out
 
 
 def _min_pilot_rate_for_groups(
@@ -52,14 +454,63 @@ def _min_pilot_rate_for_groups(
 
 
 def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
+    """Public AQP entry. Phase 3: wraps the inner implementation in a
+    top-level try/except so any rewriter / driver / pandas exception
+    is converted into a structured exact-fallback record instead of
+    propagating up to the caller. The ``(results_df, timing)`` return
+    contract from Requirement 8.1 is preserved on every input.
+
+    Two fallback reasons are added by this wrap:
+
+    - ``not_rewritable:<reason>`` — raised by
+      :func:`_check_residual_subquery_placeholder` (and any future
+      post-rewrite guard) when the rewritten SQL is unsafe to issue.
+    - ``execute_aqp_recover`` — caught from any other uncaught
+      :class:`Exception`, with the original exception type+message
+      stored in ``timing["fallback_cause"]`` for diagnostics.
+    """
+    try:
+        return _execute_aqp_internal(query, db_config, pilot_sample_rate)
+    except _UnrewritableError as e:
+        return _exact_fallback_for_query(
+            query, db_config,
+            reason=f"not_rewritable:{e.reason}",
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning(
+            "[execute_aqp wrap] uncaught %s — exact-fallback recover. cause=%r",
+            type(e).__name__, e,
+        )
+        return _exact_fallback_for_query(
+            query, db_config,
+            reason="execute_aqp_recover",
+            cause=e,
+        )
+
+
+def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
     # prepare the query and db
     dbms = db_config["dbms"]
     conn = connect_to_db(dbms, db_config)
+
+    # Track which fallback path (if any) was taken; None means AQP succeeded.
+    fallback_reason: str | None = None
 
     pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms)
     sq = Sampling_Rewriter(query.table_cols, query.table_size, dbms)
     pilot_query = pq.rewrite(query.query) + ";"
     sampling_query = sq.rewrite(query.query) + ";"
+
+    optimizer_context = build_optimization_context(
+        query_tables=query.table_cols.keys(),
+        table_sizes=query.table_size,
+    )
+
+    # Detect sampled tables from rewriter (precise) and query metadata (fallback)
+    n_sampled_tables = len(query.table_cols)
+    # pq.page_id_count tracks how many page_id columns were generated
+    # page_id_count >= 2 means a join query with multi-table sampling
+    is_join_query = getattr(pq, 'page_id_count', 0) >= 2
 
     # [FIX B6] Lemma 3.2: adjust pilot rate for GROUP BY queries
     has_group_by = len(pq.group_cols) > 0
@@ -78,8 +529,9 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
                 )
                 pilot_sample_rate = min_rate
 
-    sampling_clause = get_sampling_clause(pilot_sample_rate, dbms)
-    pilot_query = pilot_query.format(sampling_method=sampling_clause)
+    pilot_query = apply_sampling_plan_template(
+        pilot_query, scalar_rate_plan(pq.largest_table, pilot_sample_rate / 100), dbms
+    )
 
     # start execution
     timer = Timer()
@@ -87,12 +539,19 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
     setup_logging(log_file=get_log_file_path("logs", query.name, job_id))
     log_query_info(query, dbms)
     pq.log_info()
-    if dbms == DUCKDB and not pq.is_rewritable:
+    logging.info(f"optimizer context: {optimizer_context}")
+    if not pq.is_rewritable:
         final_sample_rate = 1
         sampling_query = query.query
         subquery_results = {}
+        fallback_reason = f"not_rewritable:{getattr(pq, 'unsupported_reason', None)}"
+        logging.info(
+            f"query is not rewritable by TAQA; running exact query. "
+            f"reason={getattr(pq, 'unsupported_reason', None)}"
+        )
     elif directly_run_exact(conn, query.query, pilot_query, dbms, pq.largest_table):
         final_sample_rate = 1
+        fallback_reason = "directly_run_exact"
         logging.info(f"retrieving query plan time: {timer.check('query_plan_time')}")
         subquery_results = {}
     else:
@@ -102,6 +561,13 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
         # execute pilot query
         for subquery_name, subquery_result in subquery_results.items():
             pilot_query = pilot_query.replace(subquery_name, subquery_result)
+
+        # Phase 3 guard: any `subquery_<N>` token that survived
+        # substitution means the rewriter generated an unsafe
+        # placeholder the dialect parser will reject (Q18-on-SQL-Server).
+        # Raises _UnrewritableError → wrap converts to
+        # not_rewritable:subquery_placeholder exact-fallback.
+        _check_residual_subquery_placeholder(pilot_query, pq)
 
         if dbms != SQLSERVER:
             logging.info(
@@ -126,20 +592,146 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
             pilot_rate=pilot_sample_rate / 100,
             limit=pq.limit_value,
         )
+
+        # ---- Wire Phi(Theta) constraints from pilot stats ----
+        phi_constraints = None
+        try:
+            # Extract real JoinBlockStats for multi-table join queries (Lemma 4.8)
+            join_block_stats = None
+            if is_join_query:
+                join_block_stats = _extract_join_block_stats(
+                    pilot_results, page_errors,
+                    page_id_count=getattr(pq, 'page_id_count', 0),
+                    table_sizes=query.table_size,
+                )
+                if join_block_stats is not None:
+                    logging.info(
+                        "[Lemma 4.8] Real join block stats extracted — "
+                        "full variance decomposition active."
+                    )
+                else:
+                    logging.warning(
+                        "[Lemma 4.8] Join query detected but failed to extract "
+                        "block stats. Falling back to scalar variance proxy."
+                    )
+
+            pilot_stats = _extract_pilot_stats(
+                pilot_results, page_errors, pq.group_cols, pq.limit_value,
+                join_block_stats=join_block_stats,
+            )
+            n_page_stats = len([c for c in page_errors.keys() if c != "n_page"])
+            n_groups = len(set(
+                tuple(pilot_results[pq.group_cols].iloc[i])
+                for i in range(len(pilot_results))
+            )) if pq.group_cols else 1
+
+            if pilot_stats:
+                phi_constraints = build_phi_constraints(
+                    failure_prob=query.failure_probability,
+                    n_aggregates=n_page_stats,
+                    n_groups=n_groups,
+                    pilot_stats=pilot_stats,
+                    required_error=query.error,
+                    table_names=tuple(query.table_cols.keys()),
+                )
+                logging.info(
+                    f"[Phi(Theta)] Built {len(phi_constraints.constraints)} constraints, "
+                    f"mode={phi_constraints.mode}"
+                )
+        except Exception as e:
+            logging.warning(
+                f"[Phi(Theta)] Failed to build constraints: {e}; "
+                f"falling back to scalar proxy"
+            )
+            phi_constraints = None
+
+        # ---- Guardrail: multi-table without Phi → exact ----
+        guarantee_mode = check_guarantee_mode(
+            has_phi_constraints=(phi_constraints is not None and phi_constraints.mode == "full"),
+            n_sampled_tables=n_sampled_tables,
+            pilot_block_count=len(pilot_results),
+        )
+        if guarantee_mode == "exact-required" and n_sampled_tables > 1:
+            logging.info(
+                "[GUARDRAIL] Multi-table query without sufficient Phi(Theta) "
+                "constraints. Falling back to exact execution."
+            )
+            final_sample_rate = 1
+            fallback_reason = "multi_table_no_phi"
+
+        final_sampling_plan = scalar_rate_plan(
+            pq.largest_table, final_sample_rate, reason="legacy scalar estimator"
+        )
+        output_sample_rate = final_sample_rate
+        logging.info(f"candidate sampling plan: {final_sampling_plan}")
+        if final_sample_rate != -1 and final_sample_rate != 1:
+            # --- DuckDB: full candidate plan enumeration ---
+            if dbms == DUCKDB:
+                candidate_plans = generate_candidate_plans(
+                    context=optimizer_context,
+                    table_sizes=query.table_size,
+                    min_rate=max(final_sample_rate, pilot_sample_rate / 100),
+                    max_rate=min(get_largest_sample_rate(dbms) / 100, 0.1),
+                    phi_constraints=phi_constraints,
+                )
+                for candidate_plan in candidate_plans:
+                    candidate_plan_query = apply_sampling_plan_template(
+                        sampling_query, candidate_plan, dbms
+                    )
+                    candidate_cost = estimate_cost(
+                        conn, candidate_plan_query, dbms,
+                        table_size=query.table_size, sampling_plan=candidate_plan
+                    )
+                    logging.info(
+                        f"candidate plan cost: plan={candidate_plan}, cost={candidate_cost}"
+                    )
+                best_plan = choose_lowest_cost_plan(candidate_plans)
+                if best_plan is not None:
+                    final_sampling_plan = best_plan
+                    final_sample_rate = best_plan.max_rate
+                    output_sample_rate = sampled_rate_for_output(best_plan)
+                    logging.info(f"selected best candidate plan: {best_plan}")
+
+            # --- [FIX F14] Paper §3.2: Post-pilot cost rejection for ALL DBMSes ---
+            # After the pilot, compare cost(approx_plan) vs cost(exact).
+            # If approximate costs more, fall back to exact.
+            exact_cost = estimate_cost(conn, query.query, dbms, table_size=query.table_size)
+            approx_query = apply_sampling_plan_template(
+                sampling_query, final_sampling_plan, dbms
+            )
+            approx_cost = estimate_cost(
+                conn, approx_query, dbms,
+                table_size=query.table_size, sampling_plan=final_sampling_plan
+            )
+            logging.info(
+                f"cost model: exact={exact_cost}, approx={approx_cost}, "
+                f"plan={final_sampling_plan}"
+            )
+            if should_run_exact(exact_cost, approx_cost):
+                logging.info("cost model rejected approximate plan; running exact query")
+                final_sample_rate = 1
+                if fallback_reason is None:
+                    fallback_reason = "exact_chosen_by_cost"
         logging.info(
             f"sample rate solving time: {timer.check('sampling_rate_solving')}"
         )
 
         if final_sample_rate == -1:
             final_sample_rate = 1
+            if fallback_reason is None:
+                fallback_reason = "solver_failed"
             logging.info(f"fail to solve sample rate, fall back to original queries")
         elif final_sample_rate * 100 > get_largest_sample_rate(dbms):
             logging.info(
                 f"too big sample rate {final_sample_rate*100}, fall back to original queries"
             )
             final_sample_rate = 1
+            if fallback_reason is None:
+                fallback_reason = "sample_rate_too_high"
     if final_sample_rate == 1:
-        sampling_query = sampling_query.format(sampling_method="", sample_rate="1")
+        sampling_query = apply_sampling_plan_template(
+            sampling_query, scalar_rate_plan(sq.largest_table, 1), dbms
+        ).format(sample_rate="1")
         for subquery_name, subquery_result in subquery_results.items():
             sampling_query = sampling_query.replace(subquery_name, subquery_result)
         logging.info(f"sampling query:\n{sampling_query}")
@@ -150,10 +742,9 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
     elif final_sample_rate * 100 > pilot_sample_rate:
         final_sample_rate = round(final_sample_rate * 100, 2)
         logging.info(f"final sample rate: {final_sample_rate}")
-        sampling_clause = get_sampling_clause(final_sample_rate, dbms)
-        sampling_query = sampling_query.format(
-            sampling_method=sampling_clause, sample_rate=final_sample_rate / 100
-        )
+        sampling_query = apply_sampling_plan_template(
+            sampling_query, final_sampling_plan, dbms
+        ).format(sample_rate=output_sample_rate)
         for subquery_name, subquery_result in subquery_results.items():
             sampling_query = sampling_query.replace(subquery_name, subquery_result)
         logging.info(f"sampling query:\n{sampling_query}")
@@ -165,16 +756,15 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
         logging.info(
             f"final sample rate: {final_sample_rate}, pilot sampling is large enough"
         )
-        # FIXME: directly translate pilot results instead of running sampling again
-        sampling_clause = get_sampling_clause(pilot_sample_rate, dbms)
-        sampling_query = sampling_query.format(
-            sampling_method=sampling_clause, sample_rate=pilot_sample_rate / 100
+        # [FIX B7] Direct pilot result translation — no re-sampling.
+        # Reconstruct user-facing SELECT aliases so the returned DataFrame
+        # matches the schema the exact query would produce.
+        user_aliases = _extract_user_aliases(query.query)
+        results_df = _translate_pilot_results(
+            pilot_results, pq, pilot_sample_rate, user_aliases
         )
-        for subquery_name, subquery_result in subquery_results.items():
-            sampling_query = sampling_query.replace(subquery_name, subquery_result)
-        results_df = execute_query(conn, sampling_query, dbms)
         logging.info(
-            f"sampling execution time: {timer.check('sampling_query_execution')}"
+            f"direct translate time: {timer.check('sampling_query_execution')}"
         )
 
     timer.stop()
@@ -192,6 +782,7 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
             "dbms": dbms,
             "pilot_sample_rate": pilot_sample_rate,
             "final_sample_rate": final_sample_rate,
+            "fallback_reason": fallback_reason,
             "runtime": timer.get_records(),
             "error": query.error,
             "failure_probability": query.failure_probability,
@@ -201,7 +792,11 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
         }
         f.write(json.dumps(result) + "\n")
 
-    return results_df, timer.get_records()
+    timing_out = timer.get_records()
+    timing_out["final_sample_rate"] = final_sample_rate
+    timing_out["pilot_sample_rate"] = pilot_sample_rate
+    timing_out["fallback_reason"] = fallback_reason
+    return results_df, timing_out
 
 
 def execute_block_wrong(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
@@ -472,12 +1067,13 @@ def execute_sample(query: Query, sample_rate: float, db_config: dict, add_new_lo
 
     subquery_results = process_subqueries(dbms, conn, sq)
     if sample_rate == 100:
-        sampling_query = sampling_query.format(sampling_method="", sample_rate="1")
+        sampling_query = apply_sampling_plan_template(
+            sampling_query, scalar_rate_plan(sq.largest_table, 1), dbms
+        ).format(sample_rate="1")
     else:
-        sampling_query = sampling_query.format(
-            sampling_method=get_sampling_clause(sample_rate * 100, dbms),
-            sample_rate=sample_rate,
-        )
+        sampling_query = apply_sampling_plan_template(
+            sampling_query, scalar_rate_plan(sq.largest_table, sample_rate), dbms
+        ).format(sample_rate=sample_rate)
     for subquery_name, subquery_result in subquery_results.items():
         sampling_query = sampling_query.replace(subquery_name, subquery_result)
     start = time.time()
@@ -731,7 +1327,9 @@ def run(conn: dict, query: str, error: float, probability: float):
     elif final_sample_rate * 100 > get_largest_sample_rate(_dbms):
         final_sample_rate = 1
     if final_sample_rate == 1:
-        sampling_query = sampling_query.format(sampling_method="", sample_rate="1")
+        sampling_query = apply_sampling_plan_template(
+            sampling_query, scalar_rate_plan(sq.largest_table, 1), dbms
+        ).format(sample_rate="1")
         for subquery_name, subquery_result in subquery_results.items():
             sampling_query = sampling_query.replace(subquery_name, subquery_result)
         results_df = execute_query(_conn, sampling_query, _dbms)

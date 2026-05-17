@@ -5,6 +5,9 @@ from typing import Dict, List
 import pandas as pd
 from scipy.stats import chi2, norm, t
 
+from pilotdb.pilot_engine.bounds_safety import validate_mean_bound_inputs
+from pilotdb.pilot_engine.optimizer import optimize_sampling_plan
+
 
 def get_mean_ub(
     sample_size: int, sample_mean: float, sample_std: float, failure_probability: float
@@ -89,10 +92,15 @@ def get_mean_sample_size(
     pilot_sample_std,
     pilot_sample_size,
 ):
+    validate_mean_bound_inputs(
+        error, pilot_sample_mean, pilot_sample_std, pilot_sample_size
+    )
     std_ub = get_std_ub(pilot_sample_size, pilot_sample_std, failure_probability=fp1)
     mean_lb = get_mean_lb(
         pilot_sample_size, pilot_sample_mean, pilot_sample_std, failure_probability=fp2
     )
+    if mean_lb <= 0 or not math.isfinite(mean_lb):
+        raise ValueError("pilot sample lower bound for mean must be positive and finite")
     z_val = norm.ppf(1 - fp / 2)
     return (z_val / error * std_ub / mean_lb) ** 2
 
@@ -209,7 +217,10 @@ def estimate_final_rate(
     except Exception as e:
         logging.info(f"fail to estimate final sample rate due to {e}")
         return -1
-    return max(candidate_sample_rate)
+        
+    if candidate_sample_rate:
+        return optimize_sampling_plan(candidate_sample_rate)
+    return -1
 
 
 def estimate_final_rate_uniform(
@@ -219,36 +230,46 @@ def estimate_final_rate_uniform(
     pilot_rate: float = 0.0001,
 ):
     try:
-        max_sample_rate = 0
+        candidate_sample_rates = []
+        # [FIX F17b] Paper §3.1 Boole's inequality + Procedure 1 delta split
+        n_groups = len(pilot_results)
+        n_cols = len(page_errors)
+        n_est = max(n_groups * (n_cols * 3 + 1), 1)
+        fp_each = failure_prob / n_est
         for group_id, row in pilot_results.iterrows():
             for col, error in page_errors.items():
                 if col == "size":
                     sample_size = row[col]
                     final_sample_rate = get_bernoulli_N_sample_rate(
-                        error, failure_prob, failure_prob, pilot_rate, sample_size
+                        error, fp_each, fp_each, pilot_rate, sample_size
                     )
-                    max_sample_rate = max(max_sample_rate, final_sample_rate)
+                    candidate_sample_rates.append(final_sample_rate)
                 else:
                     sample_mean = row[col]
                     sample_std = row[col.replace("avg", "std")]
                     sample_size = row["sample_size"]
+                    # [FIX F17b] Procedure 1: δ₁=δ₂=fp_each/3
+                    delta = fp_each / 3
                     final_sample_size = get_mean_sample_size(
                         error,
-                        failure_prob,
-                        failure_prob,
-                        pilot_rate,
+                        delta,
+                        delta,
+                        delta,
                         sample_mean,
                         sample_std,
                         sample_size,
                     )
                     final_sample_rate = get_sample_rate(
-                        failure_prob, final_sample_size, pilot_rate, sample_size
+                        fp_each, final_sample_size, pilot_rate, sample_size
                     )
-                max_sample_rate = max(max_sample_rate, final_sample_rate)
+                    candidate_sample_rates.append(final_sample_rate)
+                    
+        if candidate_sample_rates:
+            return optimize_sampling_plan(candidate_sample_rates)
+        return -1
     except Exception as e:
         logging.info(f"fail to estimate final sample rate due to {e}")
         return -1
-    return max_sample_rate
 
 
 def estimate_final_rate_oracle_tpch1(pilot_results: pd.DataFrame):
