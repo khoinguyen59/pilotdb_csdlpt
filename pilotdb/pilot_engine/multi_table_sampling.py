@@ -17,7 +17,11 @@ from pilotdb.pilot_engine.sampling_plan import SamplingPlan
 
 
 def get_sampling_clause(rate: float, dbms: str) -> str:
+    import os
     if dbms == DUCKDB:
+        seed = os.environ.get("PILOTDB_SEED")
+        if seed:
+            return f"TABLESAMPLE SYSTEM({rate}%) REPEATABLE ({seed})"
         return f"TABLESAMPLE SYSTEM({rate}%)"
     if dbms == POSTGRES:
         return f"TABLESAMPLE SYSTEM ({rate})"

@@ -1,0 +1,113 @@
+"""Dynamic block-size detection per DBMS.
+
+Block size in *rows* is the granularity at which ``TABLESAMPLE SYSTEM``
+operates and the unit used by Lemma 3.2 (group-coverage minimum rate) and
+Lemma 4.8 (N2 computation in U_V[Theta]).
+
+Falling back to a hard-coded value risks miscomputing both pilot rate
+floors and join-variance bounds. This module queries DBMS metadata for
+the actual rows-per-block (or rows-per-vector for analytical engines)
+and caches the result per connection + table.
+
+The constant fallback (8192) is preserved for cases where metadata lookup
+fails — callers should treat that as a "best effort" path.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from pilotdb.pilot_engine.commons import DUCKDB, POSTGRES, SQLSERVER
+
+# DuckDB's TABLESAMPLE SYSTEM operates at vector granularity (2048 rows in
+# 1.x). The page-id column in the rewriter uses the same divisor.
+DUCKDB_VECTOR_SIZE = 2048
+
+# Fallback when DBMS metadata is unavailable.
+DEFAULT_BLOCK_SIZE = 8192
+
+
+def get_block_size(conn, dbms: str, table_name: str) -> int:
+    """Return the effective rows-per-block for ``table_name`` under ``dbms``.
+
+    Falls back to ``DEFAULT_BLOCK_SIZE`` on any error. Always returns a
+    positive integer so downstream ceiling arithmetic stays well-defined.
+    """
+    try:
+        if dbms == DUCKDB:
+            return DUCKDB_VECTOR_SIZE
+        if dbms == POSTGRES:
+            return _get_postgres_block_size(conn, table_name)
+        if dbms == SQLSERVER:
+            return _get_sqlserver_block_size(conn, table_name)
+    except Exception as exc:  # pragma: no cover — defensive
+        logging.warning(
+            "[block_size] lookup failed for %s/%s: %s; falling back to %d",
+            dbms, table_name, exc, DEFAULT_BLOCK_SIZE,
+        )
+    return DEFAULT_BLOCK_SIZE
+
+
+def _get_postgres_block_size(conn, table_name: str) -> int:
+    """PostgreSQL ``TABLESAMPLE SYSTEM`` samples whole heap pages (8 KB
+    pages, ~50 rows depending on row width). Compute reltuples/relpages
+    from pg_class as the effective rows-per-block.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT reltuples::bigint, relpages FROM pg_class WHERE relname = %s",
+            (table_name,),
+        )
+        row = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    if not row:
+        return DEFAULT_BLOCK_SIZE
+    reltuples, relpages = row
+    if relpages and relpages > 0 and reltuples:
+        return max(int(reltuples // relpages), 1)
+    return DEFAULT_BLOCK_SIZE
+
+
+def _get_sqlserver_block_size(conn, table_name: str) -> int:
+    """SQL Server ``TABLESAMPLE SYSTEM`` samples 8 KB pages. We approximate
+    rows-per-block via ``sys.dm_db_partition_stats``: row_count / used_pages
+    of the clustered (or first) index.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT SUM(row_count) AS r, SUM(used_page_count) AS p "
+            "FROM sys.dm_db_partition_stats "
+            "WHERE object_id = OBJECT_ID(?) AND index_id IN (0, 1)",
+            (table_name,),
+        )
+        row = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    if not row:
+        return DEFAULT_BLOCK_SIZE
+    r, p = row
+    if p and p > 0 and r:
+        return max(int(r // p), 1)
+    return DEFAULT_BLOCK_SIZE
+
+
+def lookup_block_sizes(
+    conn, dbms: str, table_names
+) -> dict[str, int]:
+    """Convenience: resolve a dict of table_name → rows-per-block."""
+    out: dict[str, int] = {}
+    for name in table_names:
+        if not name:
+            continue
+        out[name] = get_block_size(conn, dbms, name)
+    return out

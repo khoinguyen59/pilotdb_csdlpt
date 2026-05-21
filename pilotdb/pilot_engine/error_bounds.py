@@ -100,7 +100,9 @@ def get_mean_sample_size(
         pilot_sample_size, pilot_sample_mean, pilot_sample_std, failure_probability=fp2
     )
     if mean_lb <= 0 or not math.isfinite(mean_lb):
-        raise ValueError("pilot sample lower bound for mean must be positive and finite")
+        raise ValueError("pilot sample lower bound for mean is non-positive or non-finite (degenerate bounds)")
+    if std_ub > 3.0 * pilot_sample_std:
+        std_ub = 3.0 * pilot_sample_std
     z_val = norm.ppf(1 - fp / 2)
     return (z_val / error * std_ub / mean_lb) ** 2
 
@@ -118,7 +120,8 @@ def get_sample_rate(
         bernoulli_N_lb = pilot_sample_size
     else:
         bernoulli_N_lb = get_bernoulli_N_lb(pilot_sample_size, pilot_sample_rate, fp)
-    assert sample_size <= bernoulli_N_lb, f"{sample_size} is too big"
+    if sample_size > bernoulli_N_lb:
+        return 1.0
     z_val = norm.ppf(1 - fp)
     p = _solve_quadratic(
         a=bernoulli_N_lb**2 + z_val**2 * bernoulli_N_lb,
@@ -136,6 +139,9 @@ def get_bernoulli_N_sample_rate(
     return 1 / (1 + error**2 * bernoulli_N_lb / z_val**2)
 
 
+_last_error = None
+
+
 def estimate_final_rate(
     failure_prob: float,
     pilot_results: pd.DataFrame,
@@ -144,6 +150,8 @@ def estimate_final_rate(
     pilot_rate: float = 0.0001,
     limit: int | None = None,
 ):
+    global _last_error
+    _last_error = None
     page_stats_cols = [col for col in page_errors.keys() if col != "n_page"]
     n_page_stats = len(page_stats_cols)
     page_size_stats = len(page_errors) - n_page_stats
@@ -163,28 +171,58 @@ def estimate_final_rate(
     else:
         df = pilot_results.agg(["mean", "std", "size"])
     n_groups = df.shape[0] if len(group_cols) > 0 else 1
-    n_est = n_groups * (n_page_stats * 3 + page_size_stats * 2 + 1)
+    n_est = (n_page_stats * 3 + page_size_stats * 2 + 1)
     candidate_sample_rate = []
     try:
-        # [FIX B3] Paper §3.1: Boole's inequality additive form
-        # Paper: fp_each = (1-p) / (k*m), NOT multiplicative 1-(1-fp)^(1/n)
         fp = failure_prob / n_est
         for col, error in page_errors.items():
             if len(group_cols) > 0:
                 for group_i in range(n_groups):
+                    try:
+                        if col == "n_page":
+                            sample_size = df[(page_stats_cols[0], "size")].iloc[group_i]
+                            if sample_size < 2:
+                                continue
+                            final_sample_rate = get_bernoulli_N_sample_rate(
+                                error, fp, fp, pilot_rate, sample_size
+                            )
+                            candidate_sample_rate.append(final_sample_rate)
+                        else:
+                            sample_mean = df[(col, "mean")].iloc[group_i]
+                            sample_std = df[(col, "std")].iloc[group_i]
+                            sample_size = df[(col, "size")].iloc[group_i]
+                            if sample_size < 2:
+                                continue
+                            # [FIX B4] Paper Procedure 1: δ₁=δ₂=(1-p)/3
+                            # Split failure budget into 3 equal parts:
+                            # fp for z-value, fp1 for variance bound, fp2 for mean bound
+                            delta = fp / 3
+                            final_sample_size = get_mean_sample_size(
+                                error, delta, delta, delta, sample_mean, sample_std, sample_size
+                            )
+                            final_sample_rate = get_sample_rate(
+                                fp, final_sample_size, pilot_rate, sample_size
+                            )
+                            candidate_sample_rate.append(final_sample_rate)
+                    except ValueError as e:
+                        logging.debug(f"Skipping group {group_i} for column {col} due to ValueError: {e}")
+            else:
+                try:
                     if col == "n_page":
-                        sample_size = df[(page_stats_cols[0], "size")].iloc[group_i]
+                        sample_size = df[page_stats_cols[0]].iloc[2]
+                        if sample_size < 2:
+                            continue
                         final_sample_rate = get_bernoulli_N_sample_rate(
                             error, fp, fp, pilot_rate, sample_size
                         )
                         candidate_sample_rate.append(final_sample_rate)
                     else:
-                        sample_mean = df[(col, "mean")].iloc[group_i]
-                        sample_std = df[(col, "std")].iloc[group_i]
-                        sample_size = df[(col, "size")].iloc[group_i]
+                        sample_mean = df[col].iloc[0]
+                        sample_std = df[col].iloc[1]
+                        sample_size = df[col].iloc[2]
+                        if sample_size < 2:
+                            continue
                         # [FIX B4] Paper Procedure 1: δ₁=δ₂=(1-p)/3
-                        # Split failure budget into 3 equal parts:
-                        # fp for z-value, fp1 for variance bound, fp2 for mean bound
                         delta = fp / 3
                         final_sample_size = get_mean_sample_size(
                             error, delta, delta, delta, sample_mean, sample_std, sample_size
@@ -193,33 +231,17 @@ def estimate_final_rate(
                             fp, final_sample_size, pilot_rate, sample_size
                         )
                         candidate_sample_rate.append(final_sample_rate)
-            else:
-                if col == "n_page":
-                    sample_size = df[page_stats_cols[0]].iloc[2]
-                    final_sample_rate = get_bernoulli_N_sample_rate(
-                        error, fp, fp, pilot_rate, sample_size
-                    )
-                    candidate_sample_rate.append(final_sample_rate)
-                else:
-                    sample_mean = df[col].iloc[0]
-                    sample_std = df[col].iloc[1]
-                    sample_size = df[col].iloc[2]
-                    # [FIX B4] Paper Procedure 1: δ₁=δ₂=(1-p)/3
-                    delta = fp / 3
-                    final_sample_size = get_mean_sample_size(
-                        error, delta, delta, delta, sample_mean, sample_std, sample_size
-                    )
-                    final_sample_rate = get_sample_rate(
-                        fp, final_sample_size, pilot_rate, sample_size
-                    )
-                    candidate_sample_rate.append(final_sample_rate)
+                except ValueError as e:
+                    logging.debug(f"Skipping column {col} due to ValueError: {e}")
 
     except Exception as e:
+        _last_error = str(e)
         logging.info(f"fail to estimate final sample rate due to {e}")
         return -1
         
     if candidate_sample_rate:
-        return optimize_sampling_plan(candidate_sample_rate)
+        rate = optimize_sampling_plan(candidate_sample_rate)
+        return min(max(rate, 0.0), 1.0)
     return -1
 
 
@@ -238,34 +260,42 @@ def estimate_final_rate_uniform(
         fp_each = failure_prob / n_est
         for group_id, row in pilot_results.iterrows():
             for col, error in page_errors.items():
-                if col == "size":
-                    sample_size = row[col]
-                    final_sample_rate = get_bernoulli_N_sample_rate(
-                        error, fp_each, fp_each, pilot_rate, sample_size
-                    )
-                    candidate_sample_rates.append(final_sample_rate)
-                else:
-                    sample_mean = row[col]
-                    sample_std = row[col.replace("avg", "std")]
-                    sample_size = row["sample_size"]
-                    # [FIX F17b] Procedure 1: δ₁=δ₂=fp_each/3
-                    delta = fp_each / 3
-                    final_sample_size = get_mean_sample_size(
-                        error,
-                        delta,
-                        delta,
-                        delta,
-                        sample_mean,
-                        sample_std,
-                        sample_size,
-                    )
-                    final_sample_rate = get_sample_rate(
-                        fp_each, final_sample_size, pilot_rate, sample_size
-                    )
-                    candidate_sample_rates.append(final_sample_rate)
+                try:
+                    if col == "size":
+                        sample_size = row[col]
+                        if sample_size < 2:
+                            continue
+                        final_sample_rate = get_bernoulli_N_sample_rate(
+                            error, fp_each, fp_each, pilot_rate, sample_size
+                        )
+                        candidate_sample_rates.append(final_sample_rate)
+                    else:
+                        sample_mean = row[col]
+                        sample_std = row[col.replace("avg", "std")]
+                        sample_size = row["sample_size"]
+                        if sample_size < 2:
+                            continue
+                        # [FIX F17b] Procedure 1: δ₁=δ₂=fp_each/3
+                        delta = fp_each / 3
+                        final_sample_size = get_mean_sample_size(
+                            error,
+                            delta,
+                            delta,
+                            delta,
+                            sample_mean,
+                            sample_std,
+                            sample_size,
+                        )
+                        final_sample_rate = get_sample_rate(
+                            fp_each, final_sample_size, pilot_rate, sample_size
+                        )
+                        candidate_sample_rates.append(final_sample_rate)
+                except ValueError as e:
+                    logging.debug(f"Skipping row {group_id} for column {col} due to ValueError: {e}")
                     
         if candidate_sample_rates:
-            return optimize_sampling_plan(candidate_sample_rates)
+            rate = optimize_sampling_plan(candidate_sample_rates)
+            return min(max(rate, 0.0), 1.0)
         return -1
     except Exception as e:
         logging.info(f"fail to estimate final sample rate due to {e}")
@@ -273,6 +303,22 @@ def estimate_final_rate_uniform(
 
 
 def estimate_final_rate_oracle_tpch1(pilot_results: pd.DataFrame):
+    """Ablation/oracle baseline for paper §5.5 PilotDB-O comparison only.
+
+    This is NOT the paper-faithful main path. Differences vs. ``estimate_final_rate``:
+
+      - Uses **multiplicative** Boole's inequality ``1 - (1-0.05)**(1/(k*m*4))``
+        instead of the paper §3.1 **additive** ``fp / (k*m)``.
+      - Hardcodes the relative error target to ``0.024`` and the column
+        list to TPC-H Query 1's six AVG aggregates — ignores the
+        user-supplied ``--error`` / ``--probability``.
+      - Assumes the pilot query was full-scan (``execute_oracle_aqp``
+        defaults ``pilot_sample_rate=100``), giving exact statistics.
+
+    Only invoked from :func:`execute_oracle_aqp` when ``query.name ==
+    "tpch-1"`` on PostgreSQL/SQL Server — never from the public
+    :func:`execute_aqp` entry point.
+    """
     columns = ["avg_1", "avg_2", "avg_3", "avg_4", "avg_5", "avg_6"]
     max_sample_rate = 0
     n_groups = len(pilot_results)

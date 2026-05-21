@@ -73,77 +73,7 @@ class Pilot_Rewriter:
             if len(table_set) > 1:
                 self.single_sample = True
 
-    def extract_page_id(self, is_union=False, is_join=False):
-        if self.database == POSTGRES:
-            if is_union:
-                if is_join:
-                    expresion = f"'page_id_{self.page_id_rank}:' || ({self.largest_table}.ctid::text::point)[0]::int as page_id_1"
-                    self.page_id_rank += 1
-                    self.page_id_count = 2
-                else:
-                    expresion = f"'page_id_{self.page_id_rank}:' || ({self.largest_table}.ctid::text::point)[0]::int as page_id_0"
-                    self.page_id_rank += 1
-                    self.page_id_count = 1
-            else:
-                expresion = f"'page_id_{self.page_id_rank}:' || ({self.largest_table}.ctid::text::point)[0]::int as page_id_{self.page_id_count}"
-                self.page_id_rank += 1
-                self.page_id_count += 1
-            return sqlglot.parse_one(expresion)
-        elif self.database == DUCKDB:
-            if is_union:
-                if is_join:
-                    expresion = f"'page_id_{self.page_id_rank}:' || floor({self.largest_table}.rowid/2048) as page_id_1"
-                    self.page_id_rank += 1
-                    self.page_id_count = 2
-                else:
-                    expresion = f"'page_id_{self.page_id_rank}:' || floor({self.largest_table}.rowid/2048) as page_id_0"
-                    self.page_id_rank += 1
-                    self.page_id_count = 1
-            else:
-                expresion = f"'page_id_{self.page_id_rank}:' || floor({self.largest_table}.rowid/2048) as page_id_{self.page_id_count}"
-                self.page_id_rank += 1
-                self.page_id_count += 1
-            return sqlglot.parse_one(expresion)
-        elif self.database == SQLSERVER:
-            if is_union:
-                if is_join:
-                    expresion = f"""'page_id_{self.page_id_rank}:' + CAST(CAST(SUBSTRING({self.largest_table}.%%physloc%%, 6, 1)
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 5, 1) AS int) AS VARCHAR) 
-                    + '||' + CAST(CAST(SUBSTRING({self.largest_table}.%%physloc%%, 4, 1) 
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 3, 1) + SUBSTRING({self.largest_table}.%%physloc%%, 2, 1) 
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 1, 1) AS int) AS VARCHAR)"""
-                    self.sqlserver_alias2page_id["page_id_1"] = expresion
-                    expresion = f"""{expresion} AS page_id_1"""
-                    self.page_id_rank += 1
-                    self.page_id_count = 2
-                else:
-                    expresion = f"""'page_id_{self.page_id_rank}:' + CAST(CAST(SUBSTRING({self.largest_table}.%%physloc%%, 6, 1)
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 5, 1) AS int) AS VARCHAR) 
-                    + '||' + CAST(CAST(SUBSTRING({self.largest_table}.%%physloc%%, 4, 1) 
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 3, 1) + SUBSTRING({self.largest_table}.%%physloc%%, 2, 1) 
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 1, 1) AS int) AS VARCHAR)"""
-                    self.sqlserver_alias2page_id["page_id_0"] = expresion
-                    expresion = f"""{expresion} AS page_id_0"""
-                    self.page_id_rank += 1
-                    self.page_id_count = 1
-            else:
-                expresion = f"""'page_id_{self.page_id_rank}:' + CAST(CAST(SUBSTRING({self.largest_table}.%%physloc%%, 6, 1)
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 5, 1) AS int) AS VARCHAR) 
-                    + '||' + CAST(CAST(SUBSTRING({self.largest_table}.%%physloc%%, 4, 1) 
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 3, 1) + SUBSTRING({self.largest_table}.%%physloc%%, 2, 1) 
-                    + SUBSTRING({self.largest_table}.%%physloc%%, 1, 1) AS int) AS VARCHAR)"""
-                self.sqlserver_alias2page_id[f"page_id_{self.page_id_count}"] = (
-                    expresion
-                )
-                expresion = f"""{expresion} AS page_id_{self.page_id_count}"""
-                self.page_id_rank += 1
-                self.page_id_count += 1
-            sqlserver_page_id_mapping = (
-                f"sqlserver_page_id_mapping_{self.sqlserver_page_id_mapping_count}"
-            )
-            self.sqlserver_page_id_mapping[sqlserver_page_id_mapping] = expresion
-            self.sqlserver_page_id_mapping_count += 1
-            return sqlglot.parse_one(sqlserver_page_id_mapping)
+
 
     def remove_clauses(self, expression):
         if expression.find(exp.Limit):
@@ -373,22 +303,58 @@ class Pilot_Rewriter:
             group_by_expr = exp.Group(expressions=[page_col])
             expression.set("group", group_by_expr)
 
+    LARGE_TABLE_SIZE_THRESHOLD = 100_000
+
+    def extract_page_id_for_table(self, table_identifier, index):
+        if self.database == POSTGRES:
+            expression = f"'page_id_{self.page_id_rank}:' || ({table_identifier}.ctid::text::point)[0]::int as page_id_{index}"
+            self.page_id_rank += 1
+            return sqlglot.parse_one(expression)
+        elif self.database == DUCKDB:
+            expression = f"'page_id_{self.page_id_rank}:' || floor({table_identifier}.rowid/2048) as page_id_{index}"
+            self.page_id_rank += 1
+            return sqlglot.parse_one(expression)
+        elif self.database == SQLSERVER:
+            phys_loc = f"""'page_id_{self.page_id_rank}:' + CAST(CAST(SUBSTRING({table_identifier}.%%physloc%%, 6, 1)
+            + SUBSTRING({table_identifier}.%%physloc%%, 5, 1) AS int) AS VARCHAR) 
+            + '||' + CAST(CAST(SUBSTRING({table_identifier}.%%physloc%%, 4, 1) 
+            + SUBSTRING({table_identifier}.%%physloc%%, 3, 1) + SUBSTRING({table_identifier}.%%physloc%%, 2, 1) 
+            + SUBSTRING({table_identifier}.%%physloc%%, 1, 1) AS int) AS VARCHAR)"""
+            self.sqlserver_alias2page_id[f"page_id_{index}"] = phys_loc
+            expression = f"""{phys_loc} AS page_id_{index}"""
+            self.page_id_rank += 1
+            
+            sqlserver_page_id_mapping = (
+                f"sqlserver_page_id_mapping_{self.sqlserver_page_id_mapping_count}"
+            )
+            self.sqlserver_page_id_mapping[sqlserver_page_id_mapping] = expression
+            self.sqlserver_page_id_mapping_count += 1
+            return sqlglot.parse_one(sqlserver_page_id_mapping)
+
     def add_page_id(
         self, expression, add_group_by=True, page_id=True, is_union=False, is_join=False
     ):
         if page_id:
-            page_exp = self.extract_page_id(is_union, is_join)
-            for select_expression in expression.args["expressions"]:
-                if select_expression.find(exp.Alias):
-                    self.alias_2_page_id[select_expression.find(exp.Alias).alias] = (
-                        f"page_id_{self.page_id_count-1}"
-                    )
-            expression.args["expressions"].append(page_exp)
-
-            if add_group_by or "group" in expression.args:
-                self.add_page_id_to_group_by(
-                    expression, f"page_id_{self.page_id_count-1}"
-                )
+            tables_to_page_id = []
+            if self.sampled_tables:
+                tables_to_page_id = [identifier for (_, identifier, _) in self.sampled_tables]
+            elif self.largest_table:
+                tables_to_page_id = [self.largest_table]
+            
+            self.page_id_count = len(tables_to_page_id)
+            
+            for index, identifier in enumerate(tables_to_page_id):
+                page_exp = self.extract_page_id_for_table(identifier, index)
+                expression.args["expressions"].append(page_exp)
+                
+                for select_expression in expression.args["expressions"]:
+                    if select_expression.find(exp.Alias):
+                        self.alias_2_page_id[select_expression.find(exp.Alias).alias] = (
+                            f"page_id_{index}"
+                        )
+                
+                if add_group_by or "group" in expression.args:
+                    self.add_page_id_to_group_by(expression, f"page_id_{index}")
 
         else:
             length = self.page_id_count
@@ -418,40 +384,118 @@ class Pilot_Rewriter:
             table_list.append(table)
         if "joins" in expression.args:
             for join in expression.args["joins"]:
-                table_list.append(join.find(exp.Table))
+                for table in join.find_all(exp.Table):
+                    table_list.append(table)
         return table_list
 
     def add_table_sample(self, expression):
-        tablesample = (
-            _get_from(sqlglot.parse_one("from lineitem TABLESAMPLE SYSTEM (1)")).this
-        )
-        table_list = {
-            table.this.this: table for table in self.find_all_tables(expression)
-        }
-        self.largest_table = list(table_list.keys())[0]
-        for largest_table in self.table_size:
-            if largest_table in table_list:
-                if table_list[largest_table].find(exp.TableAlias):
-                    self.largest_table = (
-                        table_list[largest_table].find(exp.TableAlias).this.this
-                    )
-                else:
-                    self.largest_table = largest_table
-                break
-
-        for table in _get_from(expression).find_all(exp.Table):
-            if table.this.this == self.largest_table:
-                tablesample.set("this", table)
-                _get_from(expression).set("this", tablesample)
-                return expression
+        candidate_tables: list[exp.Table] = []
+        from_node = _get_from(expression)
+        if from_node is not None:
+            for table in from_node.find_all(exp.Table):
+                if isinstance(table.parent, exp.TableSample):
+                    continue
+                candidate_tables.append(table)
         if "joins" in expression.args:
             for join in expression.args["joins"]:
                 for table in join.find_all(exp.Table):
-                    if table.this.this == self.largest_table:
-                        table_parent = table.parent
-                        tablesample.set("this", table)
-                        table_parent.set("this", tablesample)
-                        return expression
+                    if isinstance(table.parent, exp.TableSample):
+                        continue
+                    candidate_tables.append(table)
+
+        if not candidate_tables:
+            return False
+
+        # Filter to large tables based on the threshold
+        sampleable: list[tuple[exp.Table, str]] = []
+        for table in candidate_tables:
+            name = table.this.this
+            if (
+                name in self.table_size
+                and self.table_size[name] >= self.LARGE_TABLE_SIZE_THRESHOLD
+            ):
+                sampleable.append((table, name))
+
+        if not sampleable:
+            # Legacy single-table fallback: wrap whichever table the largest-table heuristic picks
+            table_names = [t.this.this for t in candidate_tables]
+            self.largest_table = table_names[0]
+            for name in self.table_size:
+                if name in table_names:
+                    self.largest_table = name
+                    break
+            # Find its alias
+            for table in candidate_tables:
+                if table.this.this == self.largest_table:
+                    alias = table.find(exp.TableAlias)
+                    if alias:
+                        self.largest_table = alias.this.this
+                    break
+            # Wrap in TABLESAMPLE SYSTEM (1)
+            for table in candidate_tables:
+                if table.this.this == (self.largest_table if not table.find(exp.TableAlias) else table.find(exp.TableAlias).parent.this.this):
+                    base_largest_table = self.largest_table
+                    for name in self.table_size:
+                        if name in table_names:
+                            base_largest_table = name
+                            break
+                    if table.this.this == base_largest_table:
+                        alias = table.find(exp.TableAlias)
+                        if alias:
+                            self.largest_table = alias.this.this
+                        else:
+                            self.largest_table = base_largest_table
+                        if self.database == DUCKDB:
+                            alias_name = table.alias_or_name
+                            sub = sqlglot.parse_one("SELECT *, rowid FROM x TABLESAMPLE SYSTEM (1)")
+                            from_clause = sub.args.get("from_") or sub.args.get("from")
+                            from_clause.this.this.replace(table.this.copy())
+                            sub_node = sub.subquery(alias_name)
+                            table.replace(sub_node)
+                        else:
+                            ts = _get_from(
+                                sqlglot.parse_one("from x TABLESAMPLE SYSTEM (1)")
+                            ).this
+                            ts.set("this", table.copy())
+                            table.replace(ts)
+                        return True
+            return False
+
+        # Sort sampleable tables by descending size
+        sampleable.sort(key=lambda pair: -self.table_size[pair[1]])
+        # Limit to top 2 tables to comply with Lemma 4.8 (2-way join variance decomposition)
+        sampleable = sampleable[:2]
+        
+        largest_node, largest_name = sampleable[0]
+        largest_alias = largest_node.find(exp.TableAlias)
+        if largest_alias:
+            self.largest_table = largest_alias.this.this
+        else:
+            self.largest_table = largest_name
+
+        self.sampled_tables = []
+        for idx, (table_node, table_name) in enumerate(sampleable):
+            marker_value = idx + 1
+            alias = table_node.find(exp.TableAlias)
+            identifier = alias.this.this if alias else table_name
+            self.sampled_tables.append((table_name, identifier, marker_value))
+
+            if self.database == DUCKDB:
+                alias_name = table_node.alias_or_name
+                sub = sqlglot.parse_one(f"SELECT *, rowid FROM x TABLESAMPLE SYSTEM ({marker_value})")
+                from_clause = sub.args.get("from_") or sub.args.get("from")
+                from_clause.this.this.replace(table_node.this.copy())
+                sub_node = sub.subquery(alias_name)
+                table_node.replace(sub_node)
+            else:
+                ts = _get_from(
+                    sqlglot.parse_one(
+                        f"from x TABLESAMPLE SYSTEM ({marker_value})"
+                    )
+                ).this
+                ts.set("this", table_node.copy())
+                table_node.replace(ts)
+        return True
 
     def extract_items(self, expression, type):
         extracted_items = []
@@ -658,6 +702,13 @@ class Pilot_Rewriter:
             expression.set("with", None)
 
     def replace_sample_method(self, sql_query):
+        if self.sampled_tables:
+            for table_name, identifier, marker_value in self.sampled_tables:
+                marker_sql = f"TABLESAMPLE SYSTEM ({marker_value} ROWS)"
+                sql_query = sql_query.replace(
+                    marker_sql, sampling_placeholder(table_name)
+                )
+            return sql_query
         placeholder = "{sampling_method}"
         if self.largest_table:
             placeholder = sampling_placeholder(self.largest_table)

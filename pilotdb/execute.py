@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from sqlglot import transpile
 
+from pilotdb.db_driver.block_size import DEFAULT_BLOCK_SIZE, lookup_block_sizes
 from pilotdb.db_driver.driver import *
 from pilotdb.pilot_engine.commons import *
 from pilotdb.pilot_engine.error_bounds import (
@@ -24,7 +25,11 @@ from pilotdb.pilot_engine.optimizer import (
     build_optimization_context,
     generate_candidate_plans,
 )
-from pilotdb.pilot_engine.sampling_plan import scalar_rate_plan, choose_lowest_cost_plan
+from pilotdb.pilot_engine.sampling_plan import (
+    SamplingPlan,
+    choose_lowest_cost_plan,
+    scalar_rate_plan,
+)
 from pilotdb.pilot_engine.multi_table_sampling import (
     apply_sampling_plan_template,
     sampled_rate_for_output,
@@ -181,6 +186,19 @@ def _extract_pilot_stats(
             # Replace NaN std with 0 (happens with single-block groups)
             if not math.isfinite(s_std):
                 s_std = 0.0
+            if join_block_stats is not None:
+                n1 = join_block_stats.n_pilot_blocks
+                n2 = getattr(join_block_stats, "n_pilot_blocks2", 1)
+                n_pairs = max(n1 * n2, s_size, 1)
+                sum_val = s_mean * s_size
+                true_mean = sum_val / n_pairs
+                mean_sq = s_size * (s_mean**2 + s_std**2) / n_pairs
+                var_val = mean_sq - true_mean**2
+                true_std = math.sqrt(max(var_val, 0.0))
+                s_mean = true_mean
+                s_std = true_std
+                s_size = n_pairs
+
             stat_entry = {
                 "sample_mean": s_mean,
                 "sample_std": s_std,
@@ -201,9 +219,12 @@ def _extract_join_block_stats(
     page_errors: dict,
     page_id_count: int,
     table_sizes: dict,
-    block_size: int = 8192,
+    block_size: int | None = None,
+    block_sizes: dict[str, int] | None = None,
+    sampled_tables: list | None = None,
+    pilot_rates: dict[str, float] | None = None,
 ) -> JoinBlockStats | None:
-    """Extract real JoinBlockStats (y1/y2/y3/N2) from pilot query results.
+    """Extract real JoinBlockStats (y1/y2/y3/N1/N2) from pilot query results.
 
     For two-table join queries, the pilot query produces:
       - page_id_0: block ID from the sampled table (T1)
@@ -213,6 +234,11 @@ def _extract_join_block_stats(
       y(1)_i = (Σ J(t_{1,i}, t_{2,*}))^2  — per T1-block
       y(2)_{i2,i} = J(t_{1,i}, t_{2,i2})   — per (T1-block, T2-block) pair
       y(3)_i = Σ J(t_{1,i}, t_{2,*})^2     — per T1-block
+
+    ``block_sizes`` is a per-table rows-per-block dict so N1 and N2 can use
+    each table's own granularity. The legacy ``block_size`` scalar is kept
+    for backward compatibility and applied to BOTH tables when
+    ``block_sizes`` is ``None``.
 
     Returns None if pilot results don't have multi-table page_id columns.
     """
@@ -253,6 +279,18 @@ def _extract_join_block_stats(
         pair_sums = df.groupby(["_bid_t1", "_bid_t2"])[agg_col].sum()
         y2_values = pair_sums.values.astype(float)
 
+        # y(2) pivot for per-i2 term-2 bound: shape
+        # (n_pilot_blocks, n_t2_observed). Missing pairs (no join rows)
+        # contribute 0 to the SUM aggregate, so fill with 0 is exact for
+        # SUM-style queries.
+        try:
+            y2_pivot = (
+                pair_sums.unstack(level="_bid_t2", fill_value=0.0)
+                          .to_numpy(dtype=float)
+            )
+        except Exception:
+            y2_pivot = None
+
         # y(1): per T1-block, sum across all T2 blocks, then square
         t1_sums = df.groupby("_bid_t1")[agg_col].sum()
         y1_per_block = (t1_sums.values ** 2).astype(float)
@@ -261,35 +299,107 @@ def _extract_join_block_stats(
         pair_sq = pair_sums ** 2
         y3_per_block = pair_sq.groupby(level=0).sum().values.astype(float)
 
-        # N2: estimate total blocks in T2
+        # Determine per-table block sizes. `block_sizes` (dict) takes
+        # precedence; otherwise fall back to the scalar `block_size`; if
+        # both are missing, use the module default. T1 and T2 may have
+        # different rows-per-block (analytic vs. transactional, wide vs.
+        # narrow rows), so we must look up each independently.
+        from pilotdb.db_driver.block_size import DEFAULT_BLOCK_SIZE
+        if sampled_tables:
+            t1_name = sampled_tables[0][0]
+            t2_name = sampled_tables[1][0] if len(sampled_tables) >= 2 else None
+        else:
+            table_names = list(table_sizes.keys())
+            t1_name = table_names[0] if table_names else None
+            t2_name = table_names[1] if len(table_names) >= 2 else None
+
+        if block_sizes is None:
+            scalar = block_size if block_size is not None else DEFAULT_BLOCK_SIZE
+            block_sizes = {name: scalar for name in ([t1_name, t2_name] if t2_name else [t1_name]) if name}
+
+        t1_block_size = (
+            block_sizes.get(t1_name, DEFAULT_BLOCK_SIZE)
+            if t1_name else DEFAULT_BLOCK_SIZE
+        )
+        t2_block_size = (
+            block_sizes.get(t2_name, DEFAULT_BLOCK_SIZE)
+            if t2_name else DEFAULT_BLOCK_SIZE
+        )
+
+        # N1, N2: population block counts for each table.
+        n_unique_t1 = df["_bid_t1"].nunique()
         n_unique_t2 = df["_bid_t2"].nunique()
-        # Use table_sizes to get better N2 estimate
-        table_names = list(table_sizes.keys())
-        if len(table_names) >= 2:
-            # Second table in table_sizes (T2)
-            t2_size = table_sizes.get(table_names[1], 0)
-            N2 = max(math.ceil(t2_size / block_size), n_unique_t2, 1)
+        if t1_name:
+            t1_size = table_sizes.get(t1_name, 0)
+            N1 = max(math.ceil(t1_size / t1_block_size), n_unique_t1, 1)
+        else:
+            N1 = max(n_unique_t1, 1)
+        if t2_name:
+            t2_size = table_sizes.get(t2_name, 0)
+            N2 = max(math.ceil(t2_size / t2_block_size), n_unique_t2, 1)
         else:
             N2 = max(n_unique_t2, 1)
 
-        n_pilot_blocks = len(y1_per_block)
-        pilot_rate = n_pilot_blocks / max(
-            math.ceil(table_sizes.get(table_names[0], n_pilot_blocks) / block_size),
-            1,
-        ) if table_names else 0.05
+        # Determine pilot rates
+        if pilot_rates is not None:
+            theta1 = pilot_rates.get(t1_name, 0.1) if t1_name else 0.1
+            theta2 = pilot_rates.get(t2_name, 0.1) if t2_name else 0.1
+
+            n_pilot_blocks = max(round(theta1 * N1), len(y1_per_block), 1)
+            n_pilot_blocks2 = max(round(theta2 * N2), len(y2_values) // len(y1_per_block) if len(y1_per_block) > 0 else 1, 1)
+
+            import numpy as np
+            # Pad y1_per_block to shape (n_pilot_blocks,)
+            if len(y1_per_block) < n_pilot_blocks:
+                y1_padded = np.zeros(n_pilot_blocks)
+                y1_padded[:len(y1_per_block)] = y1_per_block
+                y1_per_block = y1_padded
+
+            # Pad y3_per_block to shape (n_pilot_blocks,)
+            if len(y3_per_block) < n_pilot_blocks:
+                y3_padded = np.zeros(n_pilot_blocks)
+                y3_padded[:len(y3_per_block)] = y3_per_block
+                y3_per_block = y3_padded
+
+            # Pad y2_pivot to shape (n_pilot_blocks, n_pilot_blocks2)
+            if y2_pivot is not None:
+                p_r, p_c = y2_pivot.shape
+                if p_r < n_pilot_blocks or p_c < n_pilot_blocks2:
+                    new_r = max(n_pilot_blocks, p_r)
+                    new_c = max(n_pilot_blocks2, p_c)
+                    y2_pivot_padded = np.zeros((new_r, new_c))
+                    y2_pivot_padded[:p_r, :p_c] = y2_pivot
+                    y2_pivot = y2_pivot_padded
+
+            # Pad y2_values to shape (n_pilot_blocks * n_pilot_blocks2,)
+            n_pairs = n_pilot_blocks * n_pilot_blocks2
+            if len(y2_values) < n_pairs:
+                y2_padded = np.zeros(n_pairs)
+                y2_padded[:len(y2_values)] = y2_values
+                y2_values = y2_padded
+        else:
+            theta1 = len(y1_per_block) / N1 if N1 > 0 else 0.05
+            theta2 = 0.05
+            n_pilot_blocks = len(y1_per_block)
+            n_pilot_blocks2 = len(y2_values) // len(y1_per_block) if len(y1_per_block) > 0 else 1
 
         join_stats = JoinBlockStats(
             y1_per_block=y1_per_block,
             y2_values=y2_values,
             y3_per_block=y3_per_block,
             n_pilot_blocks=n_pilot_blocks,
+            N1=N1,
             N2=N2,
-            pilot_rate=pilot_rate,
+            pilot_rate=theta1,
+            y2_pivot=y2_pivot,
+            pilot_rate2=theta2,
+            n_pilot_blocks2=n_pilot_blocks2,
         )
         logging.info(
-            "[JoinBlockStats] Extracted: n_pilot_blocks=%d, N2=%d, "
-            "y2_pairs=%d, pilot_rate=%.4f",
-            n_pilot_blocks, N2, len(y2_values), pilot_rate,
+            "[JoinBlockStats] Extracted: n_pilot_blocks=%d, N1=%d, N2=%d, "
+            "y2_pairs=%d, pilot_rate=%.4f (t1_block=%d, t2_block=%d)",
+            n_pilot_blocks, N1, N2, len(y2_values), theta1,
+            t1_block_size, t2_block_size,
         )
         return join_stats
 
@@ -413,15 +523,18 @@ def _translate_pilot_results(
             b = grouped[mapping[SECOND_ELEMENT]].astype(float).values
             out[alias] = (a - b) / rate
         elif kind == COUNT_DISTINCT_OPERATOR:
-            # COUNT(DISTINCT x) cannot be unbiasedly upscaled from a
-            # block sample. Return the pilot-observed distinct count
-            # as a lower-bound proxy and log it.
-            col = mapping.get(PAGE_SUM) or mapping.get(PAGE_SIZE)
-            logging.warning(
-                "[direct-translate] COUNT(DISTINCT) on sample is a proxy "
-                "(pilot-observed lower bound)."
+            # Paper §2.3 explicitly excludes COUNT DISTINCT. The pilot
+            # rewriter rejects the query in `validate_supported_query`,
+            # so this branch should never be reached in the main AQP
+            # path. Reaching it indicates either (a) the rewriter check
+            # was bypassed or (b) a non-rewriter caller fed pilot
+            # results in here directly. In both cases the safe move is
+            # to refuse rather than return a biased proxy.
+            raise NotImplementedError(
+                "COUNT(DISTINCT) is not a supported AQP aggregate (paper §2.3); "
+                "rewriter should have triggered exact-fallback before reaching "
+                "_translate_pilot_results."
             )
-            out[alias] = grouped[col].astype(float).values if col else 0.0
         else:
             raise NotImplementedError(
                 f"_translate_pilot_results: unsupported aggregate kind={kind!r}"
@@ -488,9 +601,54 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
         )
 
 
+def query_table_sizes(dbms: str, db_config: dict, table_names: list[str]) -> dict[str, int]:
+    # Fallback map for TPC-H SF=1
+    fallback = {
+        "lineitem": 6_001_215,
+        "orders": 1_500_000,
+        "partsupp": 800_000,
+        "part": 200_000,
+        "customer": 150_000,
+        "supplier": 10_000,
+        "nation": 25,
+        "region": 5,
+    }
+    sizes = {}
+    try:
+        conn = connect_to_db(dbms, db_config)
+        try:
+            for name in table_names:
+                sql = f"SELECT COUNT(*) FROM {name}"
+                try:
+                    df = execute_query(conn, sql, dbms)
+                    sizes[name] = int(df.iloc[0, 0])
+                except Exception:
+                    if dbms == "sqlserver":
+                        try:
+                            df = execute_query(conn, f"SELECT COUNT(*) FROM dbo.{name}", dbms)
+                            sizes[name] = int(df.iloc[0, 0])
+                            continue
+                        except Exception:
+                            pass
+                    # If query fails, use fallback or default
+                    sizes[name] = fallback.get(name.lower(), 1_000_000)
+        finally:
+            close_connection(conn, dbms)
+    except Exception as e:
+        logging.warning(
+            "Could not connect to database to query table sizes: %s. Using fallbacks.",
+            e,
+        )
+        for name in table_names:
+            sizes[name] = fallback.get(name.lower(), 1_000_000)
+    return sizes
+
+
 def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
     # prepare the query and db
     dbms = db_config["dbms"]
+    if isinstance(query.table_size, list):
+        query.table_size = query_table_sizes(dbms, db_config, query.table_size)
     conn = connect_to_db(dbms, db_config)
 
     # Track which fallback path (if any) was taken; None means AQP succeeded.
@@ -501,16 +659,40 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
     pilot_query = pq.rewrite(query.query) + ";"
     sampling_query = sq.rewrite(query.query) + ";"
 
+    import sqlglot
+    from sqlglot import exp
+    try:
+        parsed_query = sqlglot.parse_one(query.query, read=dbms)
+        tables_in_query = {
+            table.name.lower() for table in parsed_query.find_all(exp.Table)
+        }
+        query_tables = [
+            t for t in query.table_size.keys() if t.lower() in tables_in_query
+        ]
+    except Exception:
+        query_tables = list(query.table_size.keys())
+
+    # Only optimize tables that are actually sampled in the pilot query
+    if getattr(pq, 'sampled_tables', None):
+        query_tables = [t[0] for t in pq.sampled_tables]
+
     optimizer_context = build_optimization_context(
-        query_tables=query.table_cols.keys(),
+        query_tables=query_tables,
         table_sizes=query.table_size,
     )
 
     # Detect sampled tables from rewriter (precise) and query metadata (fallback)
-    n_sampled_tables = len(query.table_cols)
+    n_sampled_tables = len(pq.sampled_tables) if getattr(pq, 'sampled_tables', None) else 1
     # pq.page_id_count tracks how many page_id columns were generated
     # page_id_count >= 2 means a join query with multi-table sampling
     is_join_query = getattr(pq, 'page_id_count', 0) >= 2
+
+    # Resolve effective rows-per-block per table from the DBMS once, then
+    # feed the dictionary into Lemma 3.2 / Lemma 4.8 helpers below so they
+    # use real metadata instead of the 8192 fallback.
+    block_sizes: dict[str, int] = lookup_block_sizes(
+        conn, dbms, list(query.table_size.keys()) if query.table_size else []
+    )
 
     # [FIX B6] Lemma 3.2: adjust pilot rate for GROUP BY queries
     has_group_by = len(pq.group_cols) > 0
@@ -518,8 +700,12 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
         largest_table_name = next(iter(query.table_size), None)
         if largest_table_name:
             largest_table_size = query.table_size[largest_table_name]
+            largest_block_size = block_sizes.get(
+                largest_table_name, DEFAULT_BLOCK_SIZE
+            )
             min_rate = _min_pilot_rate_for_groups(
                 table_size=largest_table_size,
+                block_size=largest_block_size,
                 min_group_size=200, p_fail=0.05
             )
             if min_rate > pilot_sample_rate:
@@ -529,8 +715,19 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
                 )
                 pilot_sample_rate = min_rate
 
+    if getattr(pq, 'sampled_tables', None):
+        K = len(pq.sampled_tables)
+        effective_pilot_rate = (pilot_sample_rate / 100) ** (1.0 / K) if K > 1 else (pilot_sample_rate / 100)
+        rates = {t_name: effective_pilot_rate for (t_name, _, _) in pq.sampled_tables}
+        pilot_plan = SamplingPlan(rates=rates, reason="geometric multi-table pilot plan")
+        logging.info(
+            f"[PilotDB] Multi-table pilot plan: rates={rates}, target_rate={pilot_sample_rate}%"
+        )
+    else:
+        pilot_plan = scalar_rate_plan(pq.largest_table, pilot_sample_rate / 100)
+
     pilot_query = apply_sampling_plan_template(
-        pilot_query, scalar_rate_plan(pq.largest_table, pilot_sample_rate / 100), dbms
+        pilot_query, pilot_plan, dbms
     )
 
     # start execution
@@ -552,6 +749,11 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
     elif directly_run_exact(conn, query.query, pilot_query, dbms, pq.largest_table):
         final_sample_rate = 1
         fallback_reason = "directly_run_exact"
+        # Replace the rewritten sampling_query with the original user SQL.
+        # The rewriter may have emitted `subquery_<N>` placeholders that
+        # would otherwise leak into the final query (the Q18-on-SQL-Server
+        # bug). For exact execution we never need rewriter rewrites anyway.
+        sampling_query = query.query
         logging.info(f"retrieving query plan time: {timer.check('query_plan_time')}")
         subquery_results = {}
     else:
@@ -599,10 +801,15 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
             # Extract real JoinBlockStats for multi-table join queries (Lemma 4.8)
             join_block_stats = None
             if is_join_query:
+                # Pass per-table block sizes so N1 and N2 are computed
+                # against each table's own granularity, not T1's only.
                 join_block_stats = _extract_join_block_stats(
                     pilot_results, page_errors,
                     page_id_count=getattr(pq, 'page_id_count', 0),
                     table_sizes=query.table_size,
+                    block_sizes=block_sizes,
+                    sampled_tables=getattr(pq, 'sampled_tables', None),
+                    pilot_rates=rates,
                 )
                 if join_block_stats is not None:
                     logging.info(
@@ -632,11 +839,16 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
                     n_groups=n_groups,
                     pilot_stats=pilot_stats,
                     required_error=query.error,
-                    table_names=tuple(query.table_cols.keys()),
+                    table_names=tuple(query_tables),
                 )
                 logging.info(
                     f"[Phi(Theta)] Built {len(phi_constraints.constraints)} constraints, "
                     f"mode={phi_constraints.mode}"
+                )
+                optimizer_context = build_optimization_context(
+                    query_tables=query_tables,
+                    table_sizes=query.table_size,
+                    phi_constraints=phi_constraints,
                 )
         except Exception as e:
             logging.warning(
@@ -664,54 +876,83 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
         )
         output_sample_rate = final_sample_rate
         logging.info(f"candidate sampling plan: {final_sampling_plan}")
-        if final_sample_rate != -1 and final_sample_rate != 1:
-            # --- DuckDB: full candidate plan enumeration ---
-            if dbms == DUCKDB:
-                candidate_plans = generate_candidate_plans(
-                    context=optimizer_context,
-                    table_sizes=query.table_size,
-                    min_rate=max(final_sample_rate, pilot_sample_rate / 100),
-                    max_rate=min(get_largest_sample_rate(dbms) / 100, 0.1),
-                    phi_constraints=phi_constraints,
+        has_phi = phi_constraints is not None and len(phi_constraints.constraints) > 0
+        if has_phi or (final_sample_rate != -1 and final_sample_rate != 1):
+            # --- Paper §3.2: cost-based plan enumeration for all DBMS ---
+            # Plans are generated for every subset of large tables and
+            # every per-table-weighted objective. The rewriter
+            # (`Sampling_Rewriter.add_table_sample`) now emits one
+            # TABLESAMPLE placeholder per large table, so multi-table
+            # vector plans are realised in the final SQL — not just in
+            # the chosen rate.
+            base_min_rate = final_sample_rate if (final_sample_rate != -1 and final_sample_rate != 1) else (pilot_sample_rate / 100)
+            candidate_plans = generate_candidate_plans(
+                context=optimizer_context,
+                table_sizes=query.table_size,
+                min_rate=max(base_min_rate, pilot_sample_rate / 100),
+                max_rate=min(get_largest_sample_rate(dbms) / 100, 0.1),
+                phi_constraints=phi_constraints,
+            )
+            # [FIX P0 #1] choose_lowest_cost_plan() ranks by
+            # `plan.estimated_cost`. The optimizer fills that field with
+            # its *objective-function value* (a table-size-weighted theta
+            # sum), which is NOT the DBMS cost. We must overwrite that
+            # field with the real DBMS cost estimate before selection,
+            # otherwise the chosen plan ignores EXPLAIN/SHOWPLAN entirely.
+            import dataclasses
+            costed_plans: list[SamplingPlan] = []
+            for candidate_plan in candidate_plans:
+                candidate_plan_query = apply_sampling_plan_template(
+                    sampling_query, candidate_plan, dbms
                 )
-                for candidate_plan in candidate_plans:
-                    candidate_plan_query = apply_sampling_plan_template(
-                        sampling_query, candidate_plan, dbms
-                    )
+                try:
                     candidate_cost = estimate_cost(
                         conn, candidate_plan_query, dbms,
                         table_size=query.table_size, sampling_plan=candidate_plan
                     )
-                    logging.info(
-                        f"candidate plan cost: plan={candidate_plan}, cost={candidate_cost}"
+                except Exception as exc:
+                    logging.warning(
+                        f"[optimizer] cost estimation failed for plan={candidate_plan}: {exc}. "
+                        f"Dropping plan from candidate set."
                     )
-                best_plan = choose_lowest_cost_plan(candidate_plans)
-                if best_plan is not None:
-                    final_sampling_plan = best_plan
-                    final_sample_rate = best_plan.max_rate
-                    output_sample_rate = sampled_rate_for_output(best_plan)
-                    logging.info(f"selected best candidate plan: {best_plan}")
+                    continue
+                logging.info(
+                    f"candidate plan cost: plan={candidate_plan}, cost={candidate_cost}"
+                )
+                costed_plans.append(
+                    dataclasses.replace(candidate_plan, estimated_cost=float(candidate_cost))
+                )
+            best_plan = choose_lowest_cost_plan(costed_plans)
+            if best_plan is not None:
+                final_sampling_plan = best_plan
+                final_sample_rate = best_plan.max_rate
+                output_sample_rate = sampled_rate_for_output(best_plan)
+                logging.info(f"selected best candidate plan: {best_plan}")
+            else:
+                final_sample_rate = 1
+                fallback_reason = "optimizer_infeasible"
 
             # --- [FIX F14] Paper §3.2: Post-pilot cost rejection for ALL DBMSes ---
             # After the pilot, compare cost(approx_plan) vs cost(exact).
             # If approximate costs more, fall back to exact.
-            exact_cost = estimate_cost(conn, query.query, dbms, table_size=query.table_size)
-            approx_query = apply_sampling_plan_template(
-                sampling_query, final_sampling_plan, dbms
-            )
-            approx_cost = estimate_cost(
-                conn, approx_query, dbms,
-                table_size=query.table_size, sampling_plan=final_sampling_plan
-            )
-            logging.info(
-                f"cost model: exact={exact_cost}, approx={approx_cost}, "
-                f"plan={final_sampling_plan}"
-            )
-            if should_run_exact(exact_cost, approx_cost):
-                logging.info("cost model rejected approximate plan; running exact query")
-                final_sample_rate = 1
-                if fallback_reason is None:
-                    fallback_reason = "exact_chosen_by_cost"
+            if final_sample_rate != -1 and final_sample_rate != 1:
+                exact_cost = estimate_cost(conn, query.query, dbms, table_size=query.table_size)
+                approx_query = apply_sampling_plan_template(
+                    sampling_query, final_sampling_plan, dbms
+                )
+                approx_cost = estimate_cost(
+                    conn, approx_query, dbms,
+                    table_size=query.table_size, sampling_plan=final_sampling_plan
+                )
+                logging.info(
+                    f"cost model: exact={exact_cost}, approx={approx_cost}, "
+                    f"plan={final_sampling_plan}"
+                )
+                if should_run_exact(exact_cost, approx_cost):
+                    logging.info("cost model rejected approximate plan; running exact query")
+                    final_sample_rate = 1
+                    if fallback_reason is None:
+                        fallback_reason = "exact_chosen_by_cost"
         logging.info(
             f"sample rate solving time: {timer.check('sampling_rate_solving')}"
         )
@@ -719,7 +960,14 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
         if final_sample_rate == -1:
             final_sample_rate = 1
             if fallback_reason is None:
-                fallback_reason = "solver_failed"
+                from pilotdb.pilot_engine import error_bounds
+                last_err = getattr(error_bounds, "_last_error", None)
+                if last_err and "at least two units" in last_err:
+                    fallback_reason = "pilot_sample_insufficient_units"
+                elif last_err and "degenerate bounds" in last_err:
+                    fallback_reason = "pilot_sample_degenerate_bounds"
+                else:
+                    fallback_reason = "solver_failed"
             logging.info(f"fail to solve sample rate, fall back to original queries")
         elif final_sample_rate * 100 > get_largest_sample_rate(dbms):
             logging.info(
@@ -729,13 +977,8 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
             if fallback_reason is None:
                 fallback_reason = "sample_rate_too_high"
     if final_sample_rate == 1:
-        sampling_query = apply_sampling_plan_template(
-            sampling_query, scalar_rate_plan(sq.largest_table, 1), dbms
-        ).format(sample_rate="1")
-        for subquery_name, subquery_result in subquery_results.items():
-            sampling_query = sampling_query.replace(subquery_name, subquery_result)
-        logging.info(f"sampling query:\n{sampling_query}")
-        results_df = execute_query(conn, sampling_query, dbms)
+        logging.info(f"running exact query directly:\n{query.query}")
+        results_df = execute_query(conn, query.query, dbms)
         logging.info(
             f"sampling execution time: {timer.check('sampling_query_execution')}"
         )

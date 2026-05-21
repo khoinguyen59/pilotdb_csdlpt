@@ -107,8 +107,9 @@ class TestLemma48NumericCase:
     @pytest.fixture
     def deterministic_stats(self):
         """Create deterministic join stats where we know the answer."""
-        # 10 pilot blocks from T1, N2=20 blocks in T2
+        # 10 pilot blocks observed from T1 (population N1=200), N2=20 in T2
         n_p = 10
+        N1 = 200
         N2 = 20
         # y(1): squared row sums = constant 100.0
         y1 = np.full(n_p, 100.0)
@@ -121,6 +122,7 @@ class TestLemma48NumericCase:
             y2_values=y2,
             y3_per_block=y3,
             n_pilot_blocks=n_p,
+            N1=N1,
             N2=N2,
             pilot_rate=0.05,
         )

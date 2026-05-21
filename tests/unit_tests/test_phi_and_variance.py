@@ -79,12 +79,14 @@ class TestUVTwoTable:
         """Create synthetic join statistics for testing."""
         np.random.seed(42)
         n_blocks = 50
+        N1 = 1000   # population T1 blocks (pilot saw n_blocks of them)
         N2 = 100
         return JoinBlockStats(
             y1_per_block=np.random.exponential(100, n_blocks),
             y2_values=np.random.exponential(10, n_blocks * 5),
             y3_per_block=np.random.exponential(50, n_blocks),
             n_pilot_blocks=n_blocks,
+            N1=N1,
             N2=N2,
             pilot_rate=0.05,
         )
@@ -115,6 +117,7 @@ class TestUVTwoTable:
             y2_values=np.array([10.0]),
             y3_per_block=np.array([50.0]),
             n_pilot_blocks=1,
+            N1=1000,
             N2=100,
             pilot_rate=0.05,
         )

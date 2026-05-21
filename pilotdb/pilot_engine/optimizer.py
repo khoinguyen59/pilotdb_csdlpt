@@ -7,13 +7,18 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Iterable, Mapping
 
+import math
 import numpy as np
 from scipy.optimize import NonlinearConstraint, minimize
+from scipy.stats import norm
 
 from pilotdb.pilot_engine.sampling_plan import SamplingPlan
 from pilotdb.pilot_engine.join_variance import (
     PhiConstraintSet,
     phi_constraint_residual,
+    _solve_single_phi_rate,
+    _student_t_sum_upper_bound,
+    _estimate_y2_sum_squared,
 )
 
 
@@ -158,10 +163,15 @@ def build_optimization_context(
 
 def _plan_cost_objective(table_names: tuple[str, ...], table_sizes: Mapping[str, int]):
     sizes = np.array([float(table_sizes[name]) for name in table_names], dtype=float)
+    scale = float(np.max(sizes)) if len(sizes) > 0 else 1.0
+    if scale == 0.0:
+        scale = 1.0
+    normalized_sizes = sizes / scale
 
     def objective(theta):
-        return float(np.dot(theta, sizes))
+        return float(np.dot(theta, normalized_sizes))
 
+    objective.scale = scale
     return objective
 
 
@@ -181,11 +191,54 @@ def _table_weighted_objective(
     weights = np.ones(len(table_names), dtype=float)
     weights[primary_idx] = 10.0
     weighted = sizes * weights
+    scale = float(np.max(weighted)) if len(weighted) > 0 else 1.0
+    if scale == 0.0:
+        scale = 1.0
+    normalized_weighted = weighted / scale
 
     def objective(theta):
-        return float(np.dot(theta, weighted))
+        return float(np.dot(theta, normalized_weighted))
 
+    objective.scale = scale
     return objective
+
+
+def _solve_phi_rate_for_single_variable(c, t_name: str) -> float | None:
+    # If it is a single-table constraint:
+    if c.join_stats is None:
+        if c.sampled_tables and t_name not in c.sampled_tables:
+            return None
+        return _solve_single_phi_rate(c)
+    
+    # If it is a join constraint and we only optimize t_name (the other table is 1.0):
+    t_names = c.sampled_tables
+    if not t_names or t_name not in t_names:
+        return None
+    
+    # Identify which index t_name is
+    idx = t_names.index(t_name)
+    # Let's extract delta2
+    one_minus_p_prime = 2.0 * (1.0 - norm.cdf(c.z_value))
+    delta2 = max(one_minus_p_prime / 3.0, 1e-12)
+    delta_component = delta2 / (c.join_stats.N2 + 2)
+    
+    if idx == 0:
+        constant = _student_t_sum_upper_bound(c.join_stats.y1_per_block, delta_component, population_n=c.join_stats.N1)
+    else:
+        constant = _estimate_y2_sum_squared(c.join_stats, delta_component)
+        
+    L_mu = c.L_mu
+    if c.join_stats is not None:
+        L_mu = L_mu * c.join_stats.N1 * c.join_stats.N2
+        
+    if constant <= 0 or L_mu <= 0 or not math.isfinite(L_mu):
+        return None
+        
+    rhs = (c.required_error * L_mu / (c.z_value * math.sqrt(constant))) ** 2
+    if rhs <= 0:
+        return 1.0
+    theta_min = 1.0 / (1.0 + rhs)
+    return min(max(theta_min, 1e-9), 1.0)
 
 
 def solve_trust_region_plan(
@@ -214,8 +267,31 @@ def solve_trust_region_plan(
     if lower > upper:
         return None
 
+    if phi_constraints is not None and phi_constraints.mode == "full":
+        # Early feasibility check at the maximum rates
+        max_rates = {t: upper for t in table_names}
+        if not phi_constraints.is_feasible(max_rates):
+            logging.info("[optimizer] Subset %s is infeasible at max_rate=%s, skipping optimization.", table_names, upper)
+            return None
+
+    if len(table_names) == 1:
+        t_name = table_names[0]
+        req_rates = []
+        if phi_constraints is not None and phi_constraints.mode == "full":
+            for c in phi_constraints.constraints:
+                rate = _solve_phi_rate_for_single_variable(c, t_name)
+                if rate is not None:
+                    req_rates.append(rate)
+        opt_rate = max(req_rates) if req_rates else lower
+        opt_rate = min(max(opt_rate, lower), upper)
+        rates = {t_name: opt_rate}
+        cost = opt_rate * table_sizes.get(t_name, 0)
+        logging.info("[optimizer] solve_trust_region_plan analytical solution for %s: %s", t_name, opt_rate)
+        return SamplingPlan(rates=rates, estimated_cost=cost, reason="analytical single-table solution")
+
     bounds = [(lower, upper) for _ in table_names]
     x0 = np.array([(lower + upper) / 2 for _ in table_names], dtype=float)
+    logging.info("[optimizer] solve_trust_region_plan subset=%s bounds=%s x0=%s", table_names, bounds, x0)
 
     scipy_constraints = []
     reason = "trust-constr bounded proxy for §3.2"
@@ -225,8 +301,11 @@ def solve_trust_region_plan(
         for c in phi_constraints.constraints:
             def make_phi_fn(constraint):
                 def fn(x):
-                    theta_map = {t: float(x[i]) for i, t in enumerate(table_names)}
-                    # For tables not in subset, rate = 1.0
+                    # Clip theta to safe positive range [1e-9, 1.0] for stable constraint evaluation
+                    theta_map = {
+                        t: min(max(float(x[i]), 1e-9), 1.0)
+                        for i, t in enumerate(table_names)
+                    }
                     return phi_constraint_residual(constraint, theta_map)
                 return fn
 
@@ -249,13 +328,19 @@ def solve_trust_region_plan(
     if objective_fn is None:
         objective_fn = _plan_cost_objective(table_names, table_sizes)
 
+    scale = getattr(objective_fn, "scale", 1.0)
+
     result = minimize(
         objective_fn,
         x0,
-        method="trust-constr",
+        method="SLSQP",
         bounds=bounds,
         constraints=scipy_constraints,
-        options={"verbose": 0},
+        options={"maxiter": 100},
+    )
+    logging.info(
+        "[optimizer] subset=%s success=%s message=%s x=%s fun=%s niter=%d",
+        table_names, result.success, result.message, result.x, result.fun, result.get("niter", -1)
     )
     if not result.success:
         return None
@@ -263,9 +348,10 @@ def solve_trust_region_plan(
     full_reason = reason + (f" ({reason_suffix})" if reason_suffix else "")
     return SamplingPlan(
         rates=rates,
-        estimated_cost=float(result.fun),
+        estimated_cost=float(result.fun) * scale,
         reason=full_reason,
     )
+
 
 
 def generate_candidate_plans(

@@ -281,12 +281,23 @@ def exact_run(
     transpile via sqlglot (e.g. ``date '1994-01-01'`` → ``CAST('1994-01-01' AS DATE)``).
     """
     if dbms == "duckdb":
+        import os
         import duckdb
         conn = duckdb.connect(database=path, read_only=True)
+        seed = os.environ.get("PILOTDB_SEED")
+        if seed:
+            conn.execute("SET threads = 1;")
+            try:
+                val = float(seed)
+                double_seed = (abs(int(val)) % 1000000) / 1000000.0
+                conn.execute(f"SELECT setseed({double_seed});")
+            except ValueError:
+                pass
         try:
             return conn.execute(sql).fetchdf()
         finally:
             conn.close()
+
     if dbms == "postgres":
         import pandas.io.sql as sqlio
         from pilotdb.db_driver.driver import connect_to_db

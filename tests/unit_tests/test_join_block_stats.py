@@ -156,6 +156,7 @@ class TestJoinStatsIntegrationWithPhi:
             y2_values=np.array([10.0, 20.0, 30.0]),
             y3_per_block=np.array([50.0, 60.0, 70.0]),
             n_pilot_blocks=3,
+            N1=60,
             N2=100,
             pilot_rate=0.05,
         )

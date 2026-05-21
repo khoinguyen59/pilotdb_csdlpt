@@ -285,3 +285,36 @@ def test_runner_produces_22_records_with_no_no_template(
         f"phase 2 acceptance failed: {len(no_template)} records still have "
         f"skip_reason='no_template': {[r['query_id'] for r in no_template]}"
     )
+
+
+# Queries that have a GROUP BY clause (extracted by sqlglot in the fixture
+# above). Parameterised to catch any future numeric-key misclassification
+# similar to the o_year/l_year bug fixed in Phase 2.
+_GROUP_BY_QIDS = [
+    "q1", "q3", "q4", "q5", "q7", "q8", "q9", "q10", "q11",
+    "q12", "q13", "q15", "q16", "q18", "q21", "q22",
+]
+
+
+@pytest.mark.parametrize("qid", _GROUP_BY_QIDS)
+def test_identical_dfs_produce_zero_group_error(tpch_db_path, qid):
+    """Regression: compute_detailed_group_errors(df, df, qid) must
+    return (0.0, 0.0, 0) for every GROUP BY query. Catches numeric
+    key columns (e.g. o_year, l_year) being misclassified as metrics."""
+    from pilotdb.benchmarks.run_duckdb_tpch import compute_detailed_group_errors
+    from pilotdb.benchmarks.tpch_shared import load_query_sql
+    sql = load_query_sql(qid)
+    assert sql is not None, f"{qid} template missing"
+    conn = duckdb.connect(database=tpch_db_path, read_only=True)
+    try:
+        df = conn.execute(sql).fetchdf()
+    finally:
+        conn.close()
+    mean_err, max_err, missing = compute_detailed_group_errors(df, df, qid)
+    assert mean_err == 0.0, (
+        f"{qid}: expected mean_row_relative_error=0.0 on identical DFs, got {mean_err}"
+    )
+    assert max_err == 0.0, (
+        f"{qid}: expected max_row_relative_error=0.0 on identical DFs, got {max_err}"
+    )
+    assert missing == 0, f"{qid}: missing groups on identical DFs: {missing}"

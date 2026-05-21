@@ -58,25 +58,33 @@ def execute_query(conn, query: str, dbms: str) -> pd.DataFrame:
 
 
 def get_sampling_clause(rate: float, dbms: str) -> str | None:
+    import os
     if dbms == "duckdb":
+        seed = os.environ.get("PILOTDB_SEED")
+        if seed:
+            return f"TABLESAMPLE SYSTEM({rate}%) REPEATABLE ({seed})"
         return f"TABLESAMPLE SYSTEM({rate}%)"
     elif dbms == "postgres":
         return f"TABLESAMPLE SYSTEM ({rate})"
     elif dbms == "sqlserver":
         return f"TABLESAMPLE ({rate} PERCENT)"
     else:
-        ValueError(f"Unknown DBMS: {dbms}")
+        raise ValueError(f"Unknown DBMS: {dbms}")
 
 
 def get_uniform_sampling_clause(rate: float, dbms: str) -> str | None:
+    import os
     if dbms == "duckdb":
+        seed = os.environ.get("PILOTDB_SEED")
+        if seed:
+            return f"TABLESAMPLE bernoulli({rate}%) REPEATABLE ({seed})"
         return f"TABLESAMPLE bernoulli({rate}%)"
     elif dbms == "postgres":
         return f"TABLESAMPLE BERNOULLI ({rate})"
     elif dbms == "sqlserver":
         return f"{rate / 100}"
     else:
-        ValueError(f"Unknown DBMS: {dbms}")
+        raise ValueError(f"Unknown DBMS: {dbms}")
 
 
 def estimate_cost(conn, query: str, dbms: str, table_size=None, sampling_plan=None) -> float:

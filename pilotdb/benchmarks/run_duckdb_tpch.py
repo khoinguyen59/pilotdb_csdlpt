@@ -49,6 +49,28 @@ from pilotdb.benchmarks.tpch_shared import (
 )
 
 
+def _extract_group_by_columns(qid: str) -> list[str]:
+    """Return the GROUP BY column names for the given TPC-H query,
+    extracted from the SQL template using sqlglot.
+
+    Returns an empty list if the query has no GROUP BY or if parsing
+    fails (callers should fall back to the dtype-based heuristic).
+    """
+    sql = load_query_sql(qid)
+    if sql is None:
+        return []
+    try:
+        import sqlglot
+        from sqlglot import exp
+        parsed = sqlglot.parse_one(sql)
+        group = parsed.find(exp.Group)
+        if group is None:
+            return []
+        return [e.alias_or_name for e in group.expressions]
+    except Exception:
+        return []
+
+
 # Keys every record must have. Used by tests + CSV writer.
 _REQUIRED_KEYS: frozenset[str] = frozenset({
     "query_id",
@@ -60,7 +82,11 @@ _REQUIRED_KEYS: frozenset[str] = frozenset({
     "aqp_runtime_s",
     "speedup",
     "fallback_reason",
+    "fallback_triggered",
     "relative_error",
+    "mean_row_relative_error",
+    "max_row_relative_error",
+    "missing_groups_count",
     "exact_value_sample",
     "aqp_value_sample",
     "n_rows_exact",
@@ -69,7 +95,118 @@ _REQUIRED_KEYS: frozenset[str] = frozenset({
     "skipped",
     "skip_reason",
     "timestamp_iso",
+    "variance_bound_note",
 })
+
+
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop unnamed/empty-header index columns that leak from CSV round-trips."""
+    bad = [c for c in df.columns if not c or str(c).lower().startswith("unnamed")]
+    if bad:
+        return df.drop(columns=bad)
+    return df
+
+
+def compute_detailed_group_errors(
+    exact_df: pd.DataFrame,
+    aqp_df: pd.DataFrame,
+    qid: str,
+) -> tuple[float | None, float | None, int]:
+    """Align matching group keys and compute mean/max relative error
+    and missing group counts.
+
+    Key columns are determined by parsing the SQL template's GROUP BY
+    clause with sqlglot. This prevents numeric key columns (e.g.
+    ``o_year`` int64, ``l_year`` int64) from being misclassified as
+    metric columns by the ``is_numeric_dtype`` heuristic.
+    """
+    if exact_df is None or exact_df.empty:
+        return None, None, 0
+    if aqp_df is None or aqp_df.empty:
+        return float("inf"), float("inf"), len(exact_df)
+
+    exact_df = _clean_columns(exact_df)
+    aqp_df = _clean_columns(aqp_df)
+
+    # --- Determine key vs value columns ---
+    # Preferred: use sqlglot to extract GROUP BY column names.
+    group_by_keys = _extract_group_by_columns(qid)
+    # Keep only keys that actually exist in both DataFrames.
+    group_by_keys = [k for k in group_by_keys if k in exact_df.columns and k in aqp_df.columns]
+
+    if group_by_keys:
+        key_cols = group_by_keys
+        value_cols = [
+            c for c in exact_df.columns
+            if c not in key_cols
+            and c in aqp_df.columns
+            and pd.api.types.is_numeric_dtype(exact_df[c])
+        ]
+    else:
+        # Fallback: dtype-based heuristic (original behaviour).
+        all_numeric = [c for c in exact_df.columns if pd.api.types.is_numeric_dtype(exact_df[c])]
+        key_cols = [c for c in exact_df.columns if c not in all_numeric]
+        value_cols = [c for c in all_numeric if c in aqp_df.columns]
+
+    # --- Scalar aggregate (no GROUP BY) ---
+    if not key_cols:
+        errors = []
+        for c in value_cols:
+            e_val = float(exact_df[c].iloc[0])
+            a_val = float(aqp_df[c].iloc[0])
+            errors.append(
+                abs(a_val - e_val) / abs(e_val)
+                if e_val != 0
+                else (0.0 if a_val == 0 else float("inf"))
+            )
+        if not errors:
+            return None, None, 0
+        return sum(errors) / len(errors), max(errors), 0
+
+    # --- Group-level comparison ---
+    key_cols = [c for c in key_cols if c in aqp_df.columns]
+    if not key_cols:
+        return None, None, 0
+
+    aqp_lookup: dict[tuple, dict[str, float]] = {}
+    for _, row in aqp_df.iterrows():
+        k = tuple(row[col] for col in key_cols)
+        aqp_lookup[k] = {col: row[col] for col in value_cols}
+
+    row_errors: list[float] = []
+    missing_groups = 0
+
+    for _, row in exact_df.iterrows():
+        k = tuple(row[col] for col in key_cols)
+        if k not in aqp_lookup:
+            missing_groups += 1
+            continue
+        aqp_row = aqp_lookup[k]
+        for col in value_cols:
+            if col in aqp_row:
+                e_val = row[col]
+                a_val = aqp_row[col]
+                if pd.isna(e_val) or pd.isna(a_val):
+                    continue
+                e_val = float(e_val)
+                a_val = float(a_val)
+                rel = (
+                    abs(a_val - e_val) / abs(e_val)
+                    if e_val != 0
+                    else (0.0 if a_val == 0 else float("inf"))
+                )
+                row_errors.append(rel)
+
+    finite_errors = [r for r in row_errors if r != float("inf") and not pd.isna(r)]
+    if not finite_errors:
+        return (
+            (float("inf") if missing_groups > 0 else 0.0),
+            (float("inf") if missing_groups > 0 else 0.0),
+            missing_groups,
+        )
+
+    return sum(finite_errors) / len(finite_errors), max(finite_errors), missing_groups
+
 
 
 @dataclass
@@ -123,7 +260,11 @@ def _blank_record(qid: str, opts: RunOpts, dbms: str = "duckdb") -> dict[str, An
         "aqp_runtime_s": None,
         "speedup": None,
         "fallback_reason": None,
+        "fallback_triggered": False,
         "relative_error": None,
+        "mean_row_relative_error": None,
+        "max_row_relative_error": None,
+        "missing_groups_count": None,
         "exact_value_sample": None,
         "aqp_value_sample": None,
         "n_rows_exact": None,
@@ -132,7 +273,9 @@ def _blank_record(qid: str, opts: RunOpts, dbms: str = "duckdb") -> dict[str, An
         "skipped": False,
         "skip_reason": None,
         "timestamp_iso": _utc_now_iso(),
+        "variance_bound_note": None,
     }
+
 
 
 def setup_tpch_db(sf: int, db_path: str) -> None:
@@ -199,10 +342,19 @@ def measure(
         return rec
 
     # ---- AQP -------------------------------------------------------------
+    aqp_df: pd.DataFrame | None = None
     try:
         q = build_query_obj(qid, sql,
                             error=opts.error,
                             failure_probability=opts.failure_prob)
+        if opts.sf != 1:
+            scaled_sizes = {}
+            for name, size in q.table_size.items():
+                if name.lower() in ("nation", "region"):
+                    scaled_sizes[name] = size
+                else:
+                    scaled_sizes[name] = size * opts.sf
+            q.table_size = scaled_sizes
         db_config = target.db_config()
         t0 = time.perf_counter()
         aqp_df, timing = execute_aqp(q, db_config, pilot_sample_rate=opts.pilot_rate)
@@ -211,16 +363,32 @@ def measure(
         rec["aqp_value_sample"] = scalar_summary(aqp_df, qid) if aqp_df is not None else None
         rec["final_sample_rate"] = timing.get("final_sample_rate")
         rec["fallback_reason"] = timing.get("fallback_reason")
+        rec["fallback_triggered"] = (rec["fallback_reason"] is not None)
     except Exception as e:
         rec["error"] = f"aqp:{type(e).__name__}:{e}"
         rec["fallback_reason"] = "execute_aqp_exception"
+        rec["fallback_triggered"] = True
+        rec["mean_row_relative_error"] = None
+        rec["max_row_relative_error"] = None
+        rec["missing_groups_count"] = None
         return rec
 
     # ---- summary ---------------------------------------------------------
     if rec["exact_runtime_s"] and rec["aqp_runtime_s"]:
         rec["speedup"] = rec["exact_runtime_s"] / max(rec["aqp_runtime_s"], 1e-9)
     rec["relative_error"] = summarize_error(exact_df, aqp_df, qid)
+    mean_err, max_err, missing_cnt = compute_detailed_group_errors(exact_df, aqp_df, qid)
+    rec["mean_row_relative_error"] = mean_err
+    rec["max_row_relative_error"] = max_err
+    rec["missing_groups_count"] = missing_cnt
+
+    if (rec["fallback_reason"] is None
+        and rec["mean_row_relative_error"] is not None
+        and rec["mean_row_relative_error"] > opts.error):
+        rec["variance_bound_note"] = "variance_bound_violated"
+
     return rec
+
 
 
 def _resolve_qids(spec: str) -> list[str]:

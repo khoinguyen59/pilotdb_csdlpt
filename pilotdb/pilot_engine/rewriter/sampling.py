@@ -12,6 +12,17 @@ def _get_from(expression):
     return expression.args.get("from_") or expression.args.get("from")
 
 
+def _get_with(expression):
+    return expression.args.get("with_") or expression.args.get("with")
+
+
+def _set_with(expression, value):
+    if "with_" in expression.arg_types:
+        expression.set("with_", value)
+    else:
+        expression.set("with", value)
+
+
 class Sampling_Rewriter:
     def __init__(self, table_cols, table_size, database):
         self.table_cols = table_cols
@@ -65,33 +76,108 @@ class Sampling_Rewriter:
                 table_list.append(join.find(exp.Table))
         return table_list
 
+    # Paper §3.2: tables below this size are treated as small enough to
+    # full-scan; we only sample tables with cardinality >= this threshold.
+    LARGE_TABLE_SIZE_THRESHOLD = 100_000
+
     def add_table_sample(self, expression):
-        tablesample = (
-            _get_from(sqlglot.parse_one("from lineitem TABLESAMPLE SYSTEM (1)")).this
-        )
-        table_list = [table.this.this for table in self.find_all_tables(expression)]
+        """Wrap large tables in this scope with TABLESAMPLE markers.
 
-        self.largest_table = table_list[0]
-        for largest_table in self.table_size:
-            if largest_table in table_list:
-                self.largest_table = largest_table
-                break
+        Each wrapped table gets a unique marker rate (1, 2, 3, …) so
+        `replace_sample_method` can map each rendered TABLESAMPLE back to
+        its per-table placeholder. This enables the final query to
+        realise the full vector plan §3.2 produces rather than collapsing
+        every candidate plan to a single TABLESAMPLE on `largest_table`.
 
+        Backward-compatible: when exactly one large table is in scope,
+        the resulting SQL is identical to the legacy single-table path.
+        """
+        # Collect tables in THIS scope's FROM + JOIN only — subqueries
+        # are handled recursively by `primary_query_rewriter`.
+        candidate_tables: list[exp.Table] = []
         from_node = _get_from(expression)
-        for table in from_node.find_all(exp.Table):
-            if table.this.this == self.largest_table:
-                tablesample.set("this", table)
-                from_node.set("this", tablesample)
-                return True
+        if from_node is not None:
+            for table in from_node.find_all(exp.Table):
+                if isinstance(table.parent, exp.TableSample):
+                    continue
+                candidate_tables.append(table)
         if "joins" in expression.args:
             for join in expression.args["joins"]:
                 for table in join.find_all(exp.Table):
-                    if table.this.this == largest_table:
-                        table_parent = table.parent
-                        tablesample.set("this", table)
-                        table_parent.set("this", tablesample)
-                        return True
-        return False
+                    if isinstance(table.parent, exp.TableSample):
+                        continue
+                    candidate_tables.append(table)
+
+        if not candidate_tables:
+            return False
+
+        # Filter to large tables — fall back to the legacy "always pick
+        # the largest table mentioned" behaviour when nothing qualifies,
+        # so single-table queries on small synthetic schemas still get
+        # rewritten (matching existing tests).
+        sampleable: list[tuple[exp.Table, str]] = []
+        for table in candidate_tables:
+            name = table.this.this
+            if (
+                name in self.table_size
+                and self.table_size[name] >= self.LARGE_TABLE_SIZE_THRESHOLD
+            ):
+                sampleable.append((table, name))
+
+        if not sampleable:
+            # Legacy single-table fallback: wrap whichever table the
+            # original heuristic picked (matches the previous behaviour).
+            table_names = [t.this.this for t in candidate_tables]
+            self.largest_table = table_names[0]
+            for name in self.table_size:
+                if name in table_names:
+                    self.largest_table = name
+                    break
+            for table in candidate_tables:
+                if table.this.this == self.largest_table:
+                    if self.database == DUCKDB:
+                        alias_name = table.alias_or_name
+                        sub = sqlglot.parse_one("SELECT *, rowid FROM x TABLESAMPLE SYSTEM (1)")
+                        from_clause = sub.args.get("from_") or sub.args.get("from")
+                        from_clause.this.this.replace(table.this.copy())
+                        sub_node = sub.subquery(alias_name)
+                        table.replace(sub_node)
+                    else:
+                        ts = _get_from(
+                            sqlglot.parse_one("from x TABLESAMPLE SYSTEM (1)")
+                        ).this
+                        ts.set("this", table.copy())
+                        table.replace(ts)
+                    return True
+            return False
+
+        # Multi-table path: largest_table is the biggest of the sampleable
+        # set, but we wrap *every* large table with a distinct marker.
+        sampleable.sort(key=lambda pair: -self.table_size[pair[1]])
+        # Limit to top 2 tables to comply with Lemma 4.8 (2-way join variance decomposition)
+        sampleable = sampleable[:2]
+
+        self.largest_table = sampleable[0][1]
+        self.sampled_tables = []
+        for idx, (table_node, table_name) in enumerate(sampleable):
+            marker_value = idx + 1
+            self.sampled_tables.append((table_name, marker_value))
+            if self.database == DUCKDB:
+                alias_name = table_node.alias_or_name
+                sub = sqlglot.parse_one(f"SELECT *, rowid FROM x TABLESAMPLE SYSTEM ({marker_value})")
+                from_clause = sub.args.get("from_") or sub.args.get("from")
+                from_clause.this.this.replace(table_node.this.copy())
+                sub_node = sub.subquery(alias_name)
+                table_node.replace(sub_node)
+            else:
+                ts = _get_from(
+                    sqlglot.parse_one(
+                        f"from x TABLESAMPLE SYSTEM ({marker_value})"
+                    )
+                ).this
+                ts.set("this", table_node.copy())
+                table_node.replace(ts)
+        return True
 
     def extract_items(self, expression, type):
         extracted_items = []
@@ -124,7 +210,7 @@ class Sampling_Rewriter:
                             new_cte = exp.With()
                             new_cte.set("expressions", new_cte_expression)
                             new_subquery = subquery.copy()
-                            new_subquery.set("with", new_cte)
+                            _set_with(new_subquery, new_cte)
                             if new_subquery.sql() in subquery_2_name:
                                 subquery_exp = sqlglot.parse_one(
                                     subquery_2_name[new_subquery.sql()]
@@ -288,21 +374,41 @@ class Sampling_Rewriter:
                     if cte_table.this.this in self.cte:
                         cte_alias_list.append(cte_table.this.this)
             new_ctes = []
-            for old_cte in expression.args["with"].expressions:
-                if old_cte.alias in cte_alias_list:
-                    new_ctes.append(old_cte)
+            expr_with = _get_with(expression)
+            if expr_with:
+                for old_cte in expr_with.expressions:
+                    if old_cte.alias in cte_alias_list:
+                        new_ctes.append(old_cte)
             if new_ctes:
                 new_with_expression = exp.With(expressions=new_ctes)
-                expression.set("with", new_with_expression)
+                _set_with(expression, new_with_expression)
             else:
-                expression.set("with", None)
+                _set_with(expression, None)
 
     def replace_sample_method(self, sql_query):
+        """Map per-table TABLESAMPLE markers back to per-table placeholders.
+
+        Multi-table path: `add_table_sample` placed
+        ``TABLESAMPLE SYSTEM (N ROWS)`` for each large table with N as a
+        unique marker. We rewrite each to its `{sampling_method_<table>}`
+        placeholder so `apply_sampling_plan_template` can fill them with
+        the actual per-table rate strings from the chosen plan.
+
+        Legacy path: when no multi-table markers were recorded we fall
+        back to the single-table rewrite (a single TABLESAMPLE SYSTEM
+        ``(1 ROWS)`` mapped to the largest-table placeholder).
+        """
+        if self.sampled_tables:
+            for table_name, marker_value in self.sampled_tables:
+                marker_sql = f"TABLESAMPLE SYSTEM ({marker_value} ROWS)"
+                sql_query = sql_query.replace(
+                    marker_sql, sampling_placeholder(table_name)
+                )
+            return sql_query
         placeholder = "{sampling_method}"
         if self.largest_table:
             placeholder = sampling_placeholder(self.largest_table)
-        new_query = sql_query.replace("TABLESAMPLE SYSTEM (1 ROWS)", placeholder)
-        return new_query
+        return sql_query.replace("TABLESAMPLE SYSTEM (1 ROWS)", placeholder)
 
     def modify_having(self, expression):
         for having_expression in expression.find_all(exp.Having):

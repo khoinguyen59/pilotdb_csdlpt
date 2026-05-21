@@ -17,7 +17,9 @@ def setup_logging(log_file: str):
         datefmt="(%m-%d) %H:%M:%S",
         level=logging.INFO,
         handlers=[logging.FileHandler(log_file, mode="a+"), logging.StreamHandler()],
+        force=True,
     )
+
 
 
 def dump_results(result_file: str, results_df: pd.DataFrame):

@@ -50,6 +50,9 @@ def estimate_duckdb_scanned_volume(
         return 0.0
     if sampling_plan is None:
         return float(sum(table_size.values()))
+    for rate in sampling_plan.rates.values():
+        if rate < 0:
+            return float("inf")
     return float(
         sum(size * sampling_plan.rate_for(table, 1.0) for table, size in table_size.items())
     )
