@@ -55,7 +55,28 @@ SF_TABLE_SIZES: dict[int, dict[str, int]] = {
         "nation": 25,
         "region": 5,
     },
+    10: {
+        "lineitem": 59_986_052,
+        "orders": 15_000_000,
+        "partsupp": 8_000_000,
+        "part": 2_000_000,
+        "customer": 1_500_000,
+        "supplier": 100_000,
+        "nation": 25,
+        "region": 5,
+    },
+    100: {
+        "lineitem": 600_037_902,
+        "orders": 150_000_000,
+        "partsupp": 80_000_000,
+        "part": 20_000_000,
+        "customer": 15_000_000,
+        "supplier": 1_000_000,
+        "nation": 25,
+        "region": 5,
+    },
 }
+
 
 
 def _load_pg_config(path: str | os.PathLike) -> dict:

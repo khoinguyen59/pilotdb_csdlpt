@@ -51,6 +51,11 @@ from pilotdb.utils.timer import Timer
 from pilotdb.utils.utils import dump_results, get_largest_sample_rate, setup_logging
 
 
+from pilotdb.pilot_engine.caching import PilotCacheManager
+
+cache_manager = PilotCacheManager()
+
+
 warnings.simplefilter(action="ignore", category=UserWarning)
 
 
@@ -566,7 +571,13 @@ def _min_pilot_rate_for_groups(
         return 0.05  # default fallback
 
 
-def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
+def execute_aqp(
+    query: Query,
+    db_config: dict,
+    pilot_sample_rate: float = 0.05,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+):
     """Public AQP entry. Phase 3: wraps the inner implementation in a
     top-level try/except so any rewriter / driver / pandas exception
     is converted into a structured exact-fallback record instead of
@@ -583,7 +594,13 @@ def execute_aqp(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
       stored in ``timing["fallback_cause"]`` for diagnostics.
     """
     try:
-        return _execute_aqp_internal(query, db_config, pilot_sample_rate)
+        return _execute_aqp_internal(
+            query,
+            db_config,
+            pilot_sample_rate,
+            use_cache=use_cache,
+            force_refresh=force_refresh,
+        )
     except _UnrewritableError as e:
         return _exact_fallback_for_query(
             query, db_config,
@@ -644,12 +661,80 @@ def query_table_sizes(dbms: str, db_config: dict, table_names: list[str]) -> dic
     return sizes
 
 
-def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: float = 0.05):
+def _execute_aqp_internal(
+    query: Query,
+    db_config: dict,
+    pilot_sample_rate: float = 0.05,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+):
     # prepare the query and db
     dbms = db_config["dbms"]
     if isinstance(query.table_size, list):
         query.table_size = query_table_sizes(dbms, db_config, query.table_size)
     conn = connect_to_db(dbms, db_config)
+
+    # Check Layer 2 (Template Cache)
+    if use_cache and not force_refresh:
+        cached_rates = cache_manager.get_template_cache(query.query, dbms)
+        if cached_rates is not None:
+            logging.info("[Cache Layer 2] HIT! Bypassing pilot and rate optimization.")
+            pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms)
+            sq = Sampling_Rewriter(query.table_cols, query.table_size, dbms)
+            sampling_query = sq.rewrite(query.query) + ";"
+
+            # Process subqueries (since they might be dynamic, we still do this)
+            subquery_results = process_subqueries(dbms, conn, pq)
+            
+            final_sampling_plan = SamplingPlan(rates=cached_rates, reason="cached template plan")
+            final_sample_rate = final_sampling_plan.max_rate
+            output_sample_rate = sampled_rate_for_output(final_sampling_plan)
+
+            timer = Timer()
+            job_id = str(int(timer.start() * 100))
+            setup_logging(log_file=get_log_file_path("logs", query.name, job_id))
+
+            if final_sample_rate == 1:
+                logging.info(f"running exact query directly:\n{query.query}")
+                results_df = execute_query(conn, query.query, dbms)
+            else:
+                sampling_query = apply_sampling_plan_template(
+                    sampling_query, final_sampling_plan, dbms
+                ).format(sample_rate=output_sample_rate)
+                for subquery_name, subquery_result in subquery_results.items():
+                    sampling_query = sampling_query.replace(subquery_name, subquery_result)
+                logging.info(f"sampling query (cached template):\n{sampling_query}")
+                results_df = execute_query(conn, sampling_query, dbms)
+            
+            timer.stop()
+            close_connection(conn, dbms)
+            
+            # Log results & write to all_results.jsonl
+            dump_results(
+                result_file=get_result_file_path("./results", query.name, job_id, "aqp", dbms),
+                results_df=results_df,
+            )
+            with open("all_results.jsonl", "a+") as f:
+                result = {
+                    "query": query.name,
+                    "dbms": dbms,
+                    "pilot_sample_rate": pilot_sample_rate,
+                    "final_sample_rate": final_sample_rate,
+                    "fallback_reason": "cache_hit_template",
+                    "runtime": timer.get_records(),
+                    "error": query.error,
+                    "failure_probability": query.failure_probability,
+                    "results_file": get_result_file_path(
+                        "./results", query.name, job_id, "aqp", dbms
+                    ),
+                }
+                f.write(json.dumps(result) + "\n")
+
+            timing_out = timer.get_records()
+            timing_out["final_sample_rate"] = final_sample_rate
+            timing_out["pilot_sample_rate"] = pilot_sample_rate
+            timing_out["fallback_reason"] = "cache_hit_template"
+            return results_df, timing_out
 
     # Track which fallback path (if any) was taken; None means AQP succeeded.
     fallback_reason: str | None = None
@@ -776,7 +861,17 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
                 f"pilot query:\n{transpile(pilot_query, read=dbms, pretty=True)[0]}"
             )
 
-        pilot_results = execute_query(conn, pilot_query, dbms)
+        pilot_results = None
+        if use_cache and not force_refresh:
+            pilot_results = cache_manager.get_exact_cache(pilot_query)
+        
+        if pilot_results is not None:
+            logging.info("[Cache Layer 1] HIT! Reusing pilot results DataFrame.")
+        else:
+            pilot_results = execute_query(conn, pilot_query, dbms)
+            if use_cache:
+                cache_manager.set_exact_cache(pilot_query, pilot_results)
+
         logging.info(
             f"pilot query executing time: {timer.check('pilot_query_execution')}"
         )
@@ -976,6 +1071,13 @@ def _execute_aqp_internal(query: Query, db_config: dict, pilot_sample_rate: floa
             final_sample_rate = 1
             if fallback_reason is None:
                 fallback_reason = "sample_rate_too_high"
+        if use_cache and final_sampling_plan is not None and final_sample_rate != -1:
+            if final_sample_rate == 1:
+                cached_rates_dict = {t: 1.0 for t in final_sampling_plan.rates}
+            else:
+                cached_rates_dict = final_sampling_plan.rates
+            cache_manager.set_template_cache(query.query, dbms, cached_rates_dict)
+
     if final_sample_rate == 1:
         logging.info(f"running exact query directly:\n{query.query}")
         results_df = execute_query(conn, query.query, dbms)

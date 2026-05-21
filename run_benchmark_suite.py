@@ -17,7 +17,18 @@ PILOT_RATE = 1.0
 SF = 10
 OUTPUT_DIR = Path("bench_out_sf10")
 
-def run_iteration(iter_idx: int, sf: int, output_dir: Path, queries: list[str], pilot_rate: float, num_iterations: int) -> Path:
+def run_iteration(
+    iter_idx: int,
+    sf: int,
+    output_dir: Path,
+    queries: list[str],
+    pilot_rate: float,
+    num_iterations: int,
+    dbms: str = "duckdb",
+    db_config_yaml: str | None = None,
+    error: float = 0.05,
+    failure_prob: float = 0.05,
+) -> Path:
     seed = BASE_SEED + iter_idx
     iter_dir = output_dir / f"iter_{iter_idx}"
     
@@ -36,17 +47,23 @@ def run_iteration(iter_idx: int, sf: int, output_dir: Path, queries: list[str], 
     env = os.environ.copy()
     env["PILOTDB_SEED"] = str(seed)
 
-    db_path = output_dir / f"tpch_sf{sf}.duckdb"
     cmd = [
         sys.executable,
         "-m", "pilotdb.benchmarks.run_duckdb_tpch",
-        "--dbms", "duckdb",
+        "--dbms", dbms,
         "--queries", ",".join(queries),
         "--pilot-rate", str(pilot_rate),
         "--sf", str(sf),
         "--output-dir", str(iter_dir),
-        "--db-path", str(db_path),
+        "--error", str(error),
+        "--failure-prob", str(failure_prob),
     ]
+    if dbms == "duckdb":
+        db_path = output_dir / f"tpch_sf{sf}.duckdb"
+        cmd.extend(["--db-path", str(db_path)])
+    else:
+        if db_config_yaml:
+            cmd.extend(["--db-config-yaml", db_config_yaml])
 
     t0 = time.perf_counter()
     # Run using subprocess.run
@@ -74,12 +91,20 @@ def main():
     parser.add_argument("--iterations", type=int, default=5, help="Number of iterations")
     parser.add_argument("--pilot-rate", type=float, default=1.0, help="Pilot sampling rate in percent")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--dbms", type=str, default="duckdb", choices=("duckdb", "postgres", "sqlserver"), help="Database system to benchmark")
+    parser.add_argument("--db-config-yaml", type=str, default=None, help="Path to database config YAML (Postgres/SQL Server)")
+    parser.add_argument("--error", type=float, default=0.05, help="Relative error bound")
+    parser.add_argument("--failure-prob", type=float, default=0.05, help="Failure probability bound")
     args = parser.parse_args()
 
     queries_list = args.queries.split(",")
     sf = args.sf
     num_iterations = args.iterations
     pilot_rate = args.pilot_rate
+    dbms = args.dbms
+    db_config_yaml = args.db_config_yaml
+    error = args.error
+    failure_prob = args.failure_prob
     output_dir = Path(args.output_dir) if args.output_dir else Path(f"bench_out_sf{sf}" if sf != 1 else "bench_out")
 
     try:
@@ -97,8 +122,13 @@ def main():
             output_dir=output_dir,
             queries=queries_list,
             pilot_rate=pilot_rate,
-            num_iterations=num_iterations
+            num_iterations=num_iterations,
+            dbms=dbms,
+            db_config_yaml=db_config_yaml,
+            error=error,
+            failure_prob=failure_prob,
         )
+
         with open(results_file, "r", encoding="utf-8") as f:
             data = json.load(f)
             for rec in data:
