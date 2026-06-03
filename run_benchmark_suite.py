@@ -95,6 +95,7 @@ def main():
     parser.add_argument("--db-config-yaml", type=str, default=None, help="Path to database config YAML (Postgres/SQL Server)")
     parser.add_argument("--error", type=float, default=0.05, help="Relative error bound")
     parser.add_argument("--failure-prob", type=float, default=0.05, help="Failure probability bound")
+    parser.add_argument("--aggregate-only", action="store_true", help="Only aggregate existing JSON results offline without executing queries")
     args = parser.parse_args()
 
     queries_list = args.queries.split(",")
@@ -114,20 +115,31 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     results_by_query = {q: [] for q in queries_list}
 
-    # 1. Run all iterations
+    # 1. Run or load all iterations
     for i in range(num_iterations):
-        results_file = run_iteration(
-            iter_idx=i,
-            sf=sf,
-            output_dir=output_dir,
-            queries=queries_list,
-            pilot_rate=pilot_rate,
-            num_iterations=num_iterations,
-            dbms=dbms,
-            db_config_yaml=db_config_yaml,
-            error=error,
-            failure_prob=failure_prob,
-        )
+        iter_dir = output_dir / f"iter_{i}"
+        if args.aggregate_only:
+            # Locate results file directly
+            json_files = list(iter_dir.glob("results_*.json"))
+            if not json_files:
+                print(f"Error: --aggregate-only specified but no results JSON found in {iter_dir}")
+                sys.exit(1)
+            json_files.sort()
+            results_file = json_files[-1]
+            print(f"Loading cached results for Iteration {i + 1} from {results_file.name}")
+        else:
+            results_file = run_iteration(
+                iter_idx=i,
+                sf=sf,
+                output_dir=output_dir,
+                queries=queries_list,
+                pilot_rate=pilot_rate,
+                num_iterations=num_iterations,
+                dbms=dbms,
+                db_config_yaml=db_config_yaml,
+                error=error,
+                failure_prob=failure_prob,
+            )
 
         with open(results_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -161,7 +173,19 @@ def main():
 
         # final sample rate (excluding when it fell back, if any, or including?)
         # Let's compute mean final sample rate across non-fallback runs, or all runs
-        fs_rates = [r["final_sample_rate"] for r in recs if r.get("final_sample_rate") is not None]
+        fs_rates = []
+        for r in recs:
+            rate = r.get("final_sample_rate")
+            if rate is not None:
+                # If exact fallback was triggered (except for cache hits, which are technically AQP)
+                if r.get("fallback_triggered") and r.get("fallback_reason") != "cache_hit_template":
+                    fs_rates.append(100.0)
+                else:
+                    # If it's a fraction (<= 1.0) for active AQP, scale it to percentage
+                    if rate <= 1.0:
+                        fs_rates.append(rate * 100.0)
+                    else:
+                        fs_rates.append(rate)
         # relative errors
         mean_rel_errs = [r["mean_row_relative_error"] for r in recs if r.get("mean_row_relative_error") is not None]
         max_rel_errs = [r["max_row_relative_error"] for r in recs if r.get("max_row_relative_error") is not None]
@@ -229,7 +253,7 @@ def main():
         exact_str = f"{s['mean_exact_s']:.3f}s ±{s['std_exact_s']:.3f}s" if s['mean_exact_s'] is not None else "N/A"
         aqp_str = f"{s['mean_aqp_s']:.3f}s ±{s['std_aqp_s']:.3f}s" if s['mean_aqp_s'] is not None else "N/A"
         speedup_str = f"{s['mean_speedup']:.2f}x" if s['mean_speedup'] is not None else "N/A"
-        fs_str = f"{s['mean_final_sample_rate_pct'] * 100.0:.2f}%" if s['mean_final_sample_rate_pct'] is not None else "N/A"
+        fs_str = f"{s['mean_final_sample_rate_pct']:.2f}%" if s['mean_final_sample_rate_pct'] is not None else "N/A"
         fb_str = f"{s['fallback_rate_pct']:.1f}% ({s['fallback_count']}/{num_iterations})"
         
         mean_err_str = f"{s['mean_row_relative_error'] * 100.0:.3f}%" if s['mean_row_relative_error'] is not None else "N/A"

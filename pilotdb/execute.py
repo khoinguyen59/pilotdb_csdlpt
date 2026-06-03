@@ -853,6 +853,8 @@ def _execute_aqp_internal(
             
             final_sampling_plan = SamplingPlan(rates=cached_rates, reason="cached template plan")
             final_sample_rate = final_sampling_plan.max_rate
+            if final_sample_rate != 1:
+                final_sample_rate = round(final_sample_rate * 100, 2)
             output_sample_rate = sampled_rate_for_output(final_sampling_plan)
 
             timer = Timer()
@@ -1281,6 +1283,8 @@ def _execute_aqp_internal(
         logging.info(
             f"final sample rate: {final_sample_rate}, pilot sampling is large enough"
         )
+        if final_sample_rate != 1:
+            final_sample_rate = round(final_sample_rate * 100, 2)
         # [FIX B7] Direct pilot result translation — no re-sampling.
         # Reconstruct user-facing SELECT aliases so the returned DataFrame
         # matches the schema the exact query would produce.

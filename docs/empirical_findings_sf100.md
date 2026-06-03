@@ -11,13 +11,16 @@ Trong các lượt chạy thực nghiệm PostgreSQL SF100 đầu tiên, nhật 
 * **Nguyên nhân**: Tệp cơ sở dữ liệu cache template `.pilotdb_cache.db` (dung lượng 20KB) sinh ra từ loạt chạy cục bộ **SF10** trước đó không được dọn dẹp trước khi chạy suite SF100. 
 * **Cơ chế lỗi**: Bộ tối ưu hóa Pilot đánh giá khớp mẫu truy vấn (Layer-2 Template Cache) ngay ở đầu chuỗi logic thực thi (trước khi đánh giá chốt chặn chi phí `PILOTDB_POSTGRES_COST_THRESHOLD`). Hệ thống đã nhận diện mẫu truy vấn tương tự và tái áp dụng ngay quyết định lấy mẫu cũ của quy mô SF10, hoàn toàn bỏ qua các tính toán tối ưu hóa thực tế cho tập dữ liệu lớn 100GB.
 
-### 1.2. Lỗi Tỷ Lệ Lấy Mẫu Không Tưởng `252.50%` ở Q8
-* **Hiện tượng**: Báo cáo tổng hợp in ra tỷ lệ lấy mẫu cuối cùng của truy vấn Q8 đạt mức vô lý là `252.50%`.
+### 1.2. Lỗi Tỷ Lệ Lấy Mẫu Không Tưởng `170.00%` (hoặc `252.50%` ở các lượt trước)
+* **Hiện tượng**: Báo cáo tổng hợp in ra tỷ lệ lấy mẫu cuối cùng của truy vấn Q8/Q12 đạt mức vô lý là `170.00%`.
 * **Phân tích lỗi**: 
-  1. Trong tệp cache template cũ `.pilotdb_cache.db`, tỷ lệ lấy mẫu được lưu dưới dạng phân số/hệ số thập phân (`0.05` đại diện cho 5%).
+  1. Trong tệp cache template `.pilotdb_cache.db`, tỷ lệ lấy mẫu được lưu dưới dạng phân số/hệ số thập phân (`0.05` đại diện cho 5%).
   2. Ở các phiên chạy live AQP thực tế, hệ thống trả về tỷ lệ lấy mẫu dưới dạng phần trăm thực (`5.0` đại diện cho 5%).
-  3. Bộ tổng hợp kết quả (`run_benchmark_suite.py`) thực hiện tính trung bình cộng tập hợp chứa cả số thập phân và phần trăm: $\text{Average}(5.0, 0.05) = 2.525$. Sau đó, bộ tổng hợp tiếp tục nhân giá trị trung bình này với $100.0$ một lần nữa ở đầu ra báo cáo, dẫn đến con số sai lệch nghiêm trọng `252.50%`.
-* **Giải pháp khắc phục**: Đã thực hiện xóa sạch hoàn toàn `.pilotdb_cache.db` trên VM trước khi kích hoạt chạy sạch, đồng thời điều chỉnh lại bộ tổng hợp dữ liệu để đồng bộ hóa định dạng biểu diễn tỷ lệ lấy mẫu.
+  3. Bộ tổng hợp kết quả (`run_benchmark_suite.py`) thực hiện tính trung bình cộng tập hợp chứa cả số thập phân (từ 2 lượt chạy hit cache) và phần trăm (từ 1 lượt chạy live): $\text{Average}(5.0, 0.05, 0.05) = 1.70$. Sau đó, bộ tổng hợp tiếp tục nhân giá trị trung bình này với $100.0$ một lần nữa ở đầu ra báo cáo, dẫn đến con số sai lệch `170.00%`.
+* **Giải pháp khắc phục**: 
+  1. **Sửa tại gốc (`execute.py`)**: Cập nhật hàm xử lý Cache Layer 2 để tự động quy đổi tỷ lệ lấy mẫu thành phần trăm (nhân 100) khi trả về kết quả, đảm bảo tính nhất quán đơn vị ở đầu ra của mọi phiên chạy.
+  2. **Sửa tại bộ tổng hợp (`run_benchmark_suite.py`)**: Thêm bước chuẩn hóa (normalization) toàn bộ các tỷ lệ lấy mẫu về định dạng phần trăm trước khi tính toán trung bình cộng, đồng thời thêm cờ `--aggregate-only` để tái tổng hợp dữ liệu offline hoàn toàn trong vài giây mà không cần gọi lại cơ sở dữ liệu. Kết quả sau khi sửa đổi hiển thị chính xác tỷ lệ lấy mẫu trung bình là **5.00%**.
+
 
 ---
 
