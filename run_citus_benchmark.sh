@@ -125,7 +125,7 @@ echo "[*] Chạy benchmark suite trên Citus..."
 
 # 8) KIỂM CHỨNG số liệu thật.
 echo "[*] Kiểm chứng kết quả Citus..."
-"${PYTHON_BIN}" scratch/check_aqp_engaged.py "${OUT_DIR}"
+"${PYTHON_BIN}" repro/check_aqp_engaged.py "${OUT_DIR}"
 RC=$?
 
 echo "=============================================================="

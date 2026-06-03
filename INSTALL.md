@@ -41,16 +41,16 @@ Các phụ thuộc chính (khai báo trong `pyproject.toml`): `duckdb, pandas, n
 DuckDB có extension `tpch` tích hợp; script sẽ tự sinh dữ liệu:
 ```bash
 # SF=1 (nhẹ, dùng để chạy test & tái lập COUNT DISTINCT / fixed-size)
-python scratch/generate_tpch.py --sf 1   --output tpch_sf1.db
+python repro/generate_tpch.py --sf 1   --output tpch_sf1.db
 # SF=10 (~10GB)  /  SF=100 (~100GB, cần nhiều đĩa)
-python scratch/generate_tpch.py --sf 10  --output bench_out_sf10/tpch_sf10.duckdb
-python scratch/generate_tpch.py --sf 100 --output bench_out_sf100/tpch_sf100.duckdb
+python repro/generate_tpch.py --sf 10  --output bench_out_sf10/tpch_sf10.duckdb
+python repro/generate_tpch.py --sf 100 --output bench_out_sf100/tpch_sf100.duckdb
 ```
 
 ## 4. Chạy kiểm thử (unit tests)
 
 ```bash
-python -m pytest tests/unit_tests/ -q
+python -m pytest tests/ -q
 ```
 Kỳ vọng: **203 passed, 7 skipped** (7 test e2e PostgreSQL/SQL Server bị skip nếu không có DB sống). Test e2e DuckDB chạy được ngay:
 ```bash
@@ -118,7 +118,7 @@ python -m pytest tests/e2e/test_duckdb_tpch_e2e.py -k count_distinct -v   # end-
 
 **Gap #6 — Bernoulli (row-level) vs System (block-level) sampling** (cần `tpch_sf1.db`):
 ```bash
-python scratch/run_bernoulli_vs_system.py
+python repro/run_bernoulli_vs_system.py
 # Kết quả ghi vào docs/fixed_size_comparison.md
 ```
 

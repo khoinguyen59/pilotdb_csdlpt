@@ -177,3 +177,6 @@ cython_debug/
 #.idea/
 
 project.tar.gz
+
+# Local working scratch (diagnostic / AI-helper scripts)
+scratch/

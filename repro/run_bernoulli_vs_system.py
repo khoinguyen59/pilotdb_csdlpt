@@ -9,10 +9,10 @@ So sánh hiệu năng 3 chế độ trên DuckDB SF1, ở CÙNG một tỷ lệ 
 
 Chạy thuần local trên tpch_sf1.db, KHÔNG đụng SF10/SF100.
 """
-import duckdb, time, statistics, json
+import duckdb, time, statistics, json, os
 from pathlib import Path
 
-DB = r"C:\Users\Nguyen Trong Khoi\Downloads\CSDLPT_DA\tpch_sf1.db"
+DB = os.environ.get("PILOTDB_SF1_DB", "tpch_sf1.db")
 TPL_DIR = Path("experiments/fixed_size/tpch_postgres_tsm_system_rows")
 OUT = Path("docs/fixed_size_comparison.md")
 QUERIES = ["1", "5", "6", "7", "8", "9", "12", "14", "19"]
