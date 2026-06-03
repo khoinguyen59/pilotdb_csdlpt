@@ -16,7 +16,7 @@
 | `pilotdb/pilot_engine/` | Lõi AQP: TAQA, BSAP, bộ tối ưu lấy mẫu, **`count_distinct.py`** (Chao/GEE), **`caching.py`** (Adaptive Caching) |
 | `pilotdb/db_driver/` | Trình điều khiển DuckDB / PostgreSQL / SQL Server, cost model, block-size detection |
 | `pilotdb/benchmarks/` | Loader TPC-H (`load_tpch_postgres.py`), runner |
-| `tests/` | `unit_tests/` (203 pass) + `e2e/` (DuckDB/Postgres/SQLServer) |
+| `tests/` | `unit_tests/` (186 pass) + `e2e/` (DuckDB chạy được; PG/SQLServer skip nếu thiếu DB) — tổng `tests/`: 203 pass, 7 skip |
 | `benchmarks/` | Câu truy vấn TPC-H, SSB, ClickBench, TPC-DS... |
 | `experiments/fixed_size/` | Thí nghiệm Gap #6 (Bernoulli vs block sampling) |
 | `dockerfile/` | `compose.yml` (Postgres+SQLServer single-node), `compose.citus.yml` (Citus 1 coordinator + 2 workers), `citus_init.sql` |
