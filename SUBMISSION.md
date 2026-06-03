@@ -22,7 +22,7 @@
 | `dockerfile/` | `compose.yml` (Postgres+SQLServer single-node), `compose.citus.yml` (Citus 1 coordinator + 2 workers), `citus_init.sql` |
 | `db_configs/` | Cấu hình kết nối DB (yaml) |
 | `dashboard.py` | Dashboard giám sát AQP (Streamlit) |
-| `run_*.sh` | Script chạy benchmark (postgres / citus / SF100) |
+| `run_citus_benchmark.sh` | Script tự động dựng Citus, phân tán dữ liệu và chạy benchmark |
 | `docs/` | **Báo cáo + thiết kế + kết quả** (xem mục 3) |
 
 ## 2. Dữ liệu
