@@ -15,9 +15,14 @@ from pilotdb.pilot_engine.sampling_plan import SamplingPlan
 
 
 def estimate_postgres_cost(conn, query: str) -> float:
+    import re
+    pattern = r"\b(INTERVAL) '(\d+)' (DAYS)\b"
+    query = re.sub(pattern, r"\1 '\2 \3'", query)
+    query = re.sub(r'\bDOUBLE\b(?!\s+PRECISION)', 'DOUBLE PRECISION', query)
     cur = conn.cursor()
     cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
     return float(cur.fetchone()[0][0]["Plan"]["Total Cost"])
+
 
 
 def estimate_sqlserver_cost(conn, query: str) -> float:
@@ -65,7 +70,10 @@ def estimate_query_cost(
     table_size: Mapping[str, int] | None = None,
     sampling_plan: SamplingPlan | None = None,
 ) -> float:
+    import os
     if dbms == POSTGRES:
+        if os.environ.get("PILOTDB_POSTGRES_VOLUME_PROXY", "1") == "1":
+            return estimate_duckdb_scanned_volume(table_size, sampling_plan)
         return estimate_postgres_cost(conn, query)
     if dbms == SQLSERVER:
         return estimate_sqlserver_cost(conn, query)
@@ -76,4 +84,8 @@ def estimate_query_cost(
 
 def should_run_exact(exact_cost: float, approximate_cost: float) -> bool:
     """Paper ?3.2 rejects approximate plans that cost more than exact plans."""
+    import os
+    if os.environ.get("PILOTDB_FORCE_AQP", "0") == "1":
+        return False
     return approximate_cost >= exact_cost
+

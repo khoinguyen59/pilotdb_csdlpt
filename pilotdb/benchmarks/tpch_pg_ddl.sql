@@ -1,7 +1,7 @@
--- TPC-H schema for PostgreSQL.
--- Reference: TPC-H specification v3.0.1, §1.4.
--- Column types chosen to match the canonical spec and the DuckDB-generated
--- CSV format ("." as decimal separator, "YYYY-MM-DD" as date).
+-- TPC-H schema for PostgreSQL (Optimized for High-Volume Loading without Index Thrashing)
+-- Removed PRIMARY KEY and FOREIGN KEY/REFERENCES constraints to bypass heavy indexing write overhead
+-- and prevent DiskFull limits on VM astutes. Tablesample page reads remain fully functional.
+
 DROP TABLE IF EXISTS lineitem CASCADE;
 DROP TABLE IF EXISTS orders CASCADE;
 DROP TABLE IF EXISTS partsupp CASCADE;
@@ -12,33 +12,33 @@ DROP TABLE IF EXISTS nation CASCADE;
 DROP TABLE IF EXISTS region CASCADE;
 
 CREATE TABLE region (
-    r_regionkey  INTEGER PRIMARY KEY,
+    r_regionkey  INTEGER,
     r_name       CHAR(25)    NOT NULL,
     r_comment    VARCHAR(152)
 );
 
 CREATE TABLE nation (
-    n_nationkey  INTEGER PRIMARY KEY,
+    n_nationkey  INTEGER,
     n_name       CHAR(25)    NOT NULL,
-    n_regionkey  INTEGER     NOT NULL REFERENCES region(r_regionkey),
+    n_regionkey  INTEGER     NOT NULL,
     n_comment    VARCHAR(152)
 );
 
 CREATE TABLE supplier (
-    s_suppkey    INTEGER PRIMARY KEY,
+    s_suppkey    INTEGER,
     s_name       CHAR(25)    NOT NULL,
     s_address    VARCHAR(40) NOT NULL,
-    s_nationkey  INTEGER     NOT NULL REFERENCES nation(n_nationkey),
+    s_nationkey  INTEGER     NOT NULL,
     s_phone      CHAR(15)    NOT NULL,
     s_acctbal    DECIMAL(15,2) NOT NULL,
     s_comment    VARCHAR(101) NOT NULL
 );
 
 CREATE TABLE customer (
-    c_custkey    INTEGER PRIMARY KEY,
+    c_custkey    INTEGER,
     c_name       VARCHAR(25) NOT NULL,
     c_address    VARCHAR(40) NOT NULL,
-    c_nationkey  INTEGER     NOT NULL REFERENCES nation(n_nationkey),
+    c_nationkey  INTEGER     NOT NULL,
     c_phone      CHAR(15)    NOT NULL,
     c_acctbal    DECIMAL(15,2) NOT NULL,
     c_mktsegment CHAR(10)    NOT NULL,
@@ -46,7 +46,7 @@ CREATE TABLE customer (
 );
 
 CREATE TABLE part (
-    p_partkey     INTEGER PRIMARY KEY,
+    p_partkey     INTEGER,
     p_name        VARCHAR(55) NOT NULL,
     p_mfgr        CHAR(25)    NOT NULL,
     p_brand       CHAR(10)    NOT NULL,
@@ -58,17 +58,16 @@ CREATE TABLE part (
 );
 
 CREATE TABLE partsupp (
-    ps_partkey    INTEGER NOT NULL REFERENCES part(p_partkey),
-    ps_suppkey    INTEGER NOT NULL REFERENCES supplier(s_suppkey),
+    ps_partkey    INTEGER NOT NULL,
+    ps_suppkey    INTEGER NOT NULL,
     ps_availqty   INTEGER NOT NULL,
     ps_supplycost DECIMAL(15,2) NOT NULL,
-    ps_comment    VARCHAR(199) NOT NULL,
-    PRIMARY KEY (ps_partkey, ps_suppkey)
+    ps_comment    VARCHAR(199) NOT NULL
 );
 
 CREATE TABLE orders (
-    o_orderkey      INTEGER PRIMARY KEY,
-    o_custkey       INTEGER NOT NULL REFERENCES customer(c_custkey),
+    o_orderkey      INTEGER,
+    o_custkey       INTEGER NOT NULL,
     o_orderstatus   CHAR(1) NOT NULL,
     o_totalprice    DECIMAL(15,2) NOT NULL,
     o_orderdate     DATE    NOT NULL,
@@ -79,9 +78,9 @@ CREATE TABLE orders (
 );
 
 CREATE TABLE lineitem (
-    l_orderkey      INTEGER NOT NULL REFERENCES orders(o_orderkey),
-    l_partkey       INTEGER NOT NULL REFERENCES part(p_partkey),
-    l_suppkey       INTEGER NOT NULL REFERENCES supplier(s_suppkey),
+    l_orderkey      INTEGER NOT NULL,
+    l_partkey       INTEGER NOT NULL,
+    l_suppkey       INTEGER NOT NULL,
     l_linenumber    INTEGER NOT NULL,
     l_quantity      DECIMAL(15,2) NOT NULL,
     l_extendedprice DECIMAL(15,2) NOT NULL,
@@ -94,6 +93,5 @@ CREATE TABLE lineitem (
     l_receiptdate   DATE    NOT NULL,
     l_shipinstruct  CHAR(25) NOT NULL,
     l_shipmode      CHAR(10) NOT NULL,
-    l_comment       VARCHAR(44) NOT NULL,
-    PRIMARY KEY (l_orderkey, l_linenumber)
+    l_comment       VARCHAR(44) NOT NULL
 );

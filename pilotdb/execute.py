@@ -661,6 +661,135 @@ def query_table_sizes(dbms: str, db_config: dict, table_names: list[str]) -> dic
     return sizes
 
 
+def _get_single_table_distinct_info(query_sql: str, dbms: str) -> tuple[str, str] | None:
+    import sqlglot
+    from sqlglot import exp
+    try:
+        parsed = sqlglot.parse_one(query_sql, read=dbms)
+        tables = [t.name for t in parsed.find_all(exp.Table)]
+        if len(tables) != 1:
+            return None
+        table_name = tables[0]
+        
+        count_node = parsed.find(exp.Count)
+        if not count_node:
+            return None
+            
+        inner = count_node.this
+        if isinstance(inner, exp.Distinct):
+            inner = inner.expressions[0] if inner.expressions else inner.this
+            
+        col_sql = inner.sql(dialect=dbms)
+        return table_name, col_sql
+    except Exception as e:
+        logger.warning("Failed to extract distinct info from query: %s", e)
+        return None
+
+
+def _execute_count_distinct_aqp(
+    conn,
+    query: Query,
+    pq: Pilot_Rewriter,
+    sq: Sampling_Rewriter,
+    db_config: dict,
+    pilot_sample_rate: float,
+    timer: Timer,
+    job_id: str,
+) -> tuple[pd.DataFrame, dict]:
+    """Execute AQP path for single-table COUNT(DISTINCT) queries.
+    
+    Bypasses the normal pilot rate solver, executes a sample at a fixed
+    rate (the pilot sample rate), and applies Chao/GEE distinct estimators.
+    """
+    dbms = db_config["dbms"]
+    
+    # 1. Parse and extract table/column info
+    info = _get_single_table_distinct_info(query.query, dbms)
+    if info is None:
+        return _exact_fallback_for_query(query, db_config, reason="count_distinct_unsupported_parse", conn=conn)
+    table_name, col_sql = info
+    
+    # 2. Get table size N
+    N = query.table_size.get(table_name, 1_000_000)
+    
+    # 3. Determine sampling rate p
+    p = pilot_sample_rate / 100.0
+    p = max(0.0001, min(0.9999, p))
+    p_percent = p * 100.0
+    
+    # 4. Formulate the frequency-of-frequency helper query
+    from pilotdb.pilot_engine.multi_table_sampling import get_sampling_clause
+    sampling_clause = get_sampling_clause(p_percent, dbms)
+    
+    helper_query = f"""
+    SELECT 
+        COUNT(*) as d,
+        SUM(CASE WHEN cnt = 1 THEN 1 ELSE 0 END) as f1,
+        SUM(CASE WHEN cnt = 2 THEN 1 ELSE 0 END) as f2
+    FROM (
+        SELECT {col_sql}, COUNT(*) as cnt 
+        FROM {table_name} {sampling_clause}
+        GROUP BY {col_sql}
+    ) AS sub
+    """
+    
+    logging.info("[COUNT(DISTINCT)] executing helper frequency query: %s", helper_query)
+    
+    try:
+        stats_df = execute_query(conn, helper_query, dbms)
+        row = stats_df.iloc[0]
+        d = float(row.get("d", 0.0) if not pd.isna(row.get("d")) else 0.0)
+        f1 = float(row.get("f1", 0.0) if not pd.isna(row.get("f1")) else 0.0)
+        f2 = float(row.get("f2", 0.0) if not pd.isna(row.get("f2")) else 0.0)
+    except Exception as e:
+        logging.warning("[COUNT(DISTINCT)] helper query failed: %s. Falling back to exact.", e)
+        return _exact_fallback_for_query(query, db_config, reason="count_distinct_helper_failed", cause=e, conn=conn)
+        
+    # 5. Apply Chao/GEE distinct estimators
+    from pilotdb.pilot_engine.count_distinct import estimate_distinct
+    est = estimate_distinct(d, f1, f2, p, N=N)
+    
+    # 6. Format output DataFrame
+    import sqlglot
+    from sqlglot import exp
+    parsed = sqlglot.parse_one(query.query, read=dbms)
+    select_expr = parsed.expressions[0]
+    alias_name = select_expr.alias if select_expr.alias else select_expr.sql(dialect=dbms)
+    
+    results_df = pd.DataFrame([{alias_name: est}])
+    
+    # 7. Write to log/results
+    timer.stop()
+    timing_out = timer.get_records()
+    timing_out["final_sample_rate"] = p
+    timing_out["pilot_sample_rate"] = pilot_sample_rate
+    timing_out["fallback_reason"] = None
+    
+    logging.info("[COUNT(DISTINCT)] estimated: %s (sample_d=%s, f1=%s, f2=%s, p=%s, N=%s)", est, d, f1, f2, p, N)
+    
+    dump_results(
+        result_file=get_result_file_path("./results", query.name, job_id, "aqp", dbms),
+        results_df=results_df,
+    )
+    with open("all_results.jsonl", "a+") as f:
+        result = {
+            "query": query.name,
+            "dbms": dbms,
+            "pilot_sample_rate": pilot_sample_rate,
+            "final_sample_rate": p,
+            "fallback_reason": None,
+            "runtime": timing_out,
+            "error": query.error,
+            "failure_probability": query.failure_probability,
+            "results_file": get_result_file_path(
+                "./results", query.name, job_id, "aqp", dbms
+            ),
+        }
+        f.write(json.dumps(result) + "\n")
+        
+    return results_df, timing_out
+
+
 def _execute_aqp_internal(
     query: Query,
     db_config: dict,
@@ -674,12 +803,48 @@ def _execute_aqp_internal(
         query.table_size = query_table_sizes(dbms, db_config, query.table_size)
     conn = connect_to_db(dbms, db_config)
 
+    # Detect if the query contains COUNT(DISTINCT) and is single-table
+    import sqlglot
+    from sqlglot import exp
+    
+    has_count_distinct = False
+    try:
+        parsed_q = sqlglot.parse_one(query.query, read=dbms)
+        for count_node in parsed_q.find_all(exp.Count):
+            if count_node.args.get("distinct") or isinstance(count_node.this, exp.Distinct):
+                has_count_distinct = True
+                break
+    except Exception:
+        pass
+
+    if has_count_distinct:
+        pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms, db_config)
+        sq = Sampling_Rewriter(query.table_cols, query.table_size, dbms)
+        is_supported = False
+        try:
+            parsed_q = sqlglot.parse_one(query.query, read=dbms)
+            is_supported = pq.validate_supported_query(parsed_q)
+        except Exception:
+            is_supported = False
+            
+        if is_supported:
+            timer = Timer()
+            job_id = str(int(timer.start() * 100))
+            setup_logging(log_file=get_log_file_path("logs", query.name, job_id))
+            try:
+                res_df, timing = _execute_count_distinct_aqp(
+                    conn, query, pq, sq, db_config, pilot_sample_rate, timer, job_id
+                )
+                return res_df, timing
+            finally:
+                close_connection(conn, dbms)
+
     # Check Layer 2 (Template Cache)
     if use_cache and not force_refresh:
         cached_rates = cache_manager.get_template_cache(query.query, dbms)
         if cached_rates is not None:
             logging.info("[Cache Layer 2] HIT! Bypassing pilot and rate optimization.")
-            pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms)
+            pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms, db_config)
             sq = Sampling_Rewriter(query.table_cols, query.table_size, dbms)
             sampling_query = sq.rewrite(query.query) + ";"
 
@@ -704,7 +869,14 @@ def _execute_aqp_internal(
                 for subquery_name, subquery_result in subquery_results.items():
                     sampling_query = sampling_query.replace(subquery_name, subquery_result)
                 logging.info(f"sampling query (cached template):\n{sampling_query}")
-                results_df = execute_query(conn, sampling_query, dbms)
+                
+                if _RESIDUAL_PLACEHOLDER_PAT.search(sampling_query):
+                    logging.info("[Cache Layer 2] residual subquery placeholder in cached template query; running exact query.")
+                    final_sample_rate = 1
+                    results_df = execute_query(conn, query.query, dbms)
+                else:
+                    results_df = execute_query(conn, sampling_query, dbms)
+
             
             timer.stop()
             close_connection(conn, dbms)
@@ -739,7 +911,7 @@ def _execute_aqp_internal(
     # Track which fallback path (if any) was taken; None means AQP succeeded.
     fallback_reason: str | None = None
 
-    pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms)
+    pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms, db_config)
     sq = Sampling_Rewriter(query.table_cols, query.table_size, dbms)
     pilot_query = pq.rewrite(query.query) + ";"
     sampling_query = sq.rewrite(query.query) + ";"
@@ -776,7 +948,7 @@ def _execute_aqp_internal(
     # feed the dictionary into Lemma 3.2 / Lemma 4.8 helpers below so they
     # use real metadata instead of the 8192 fallback.
     block_sizes: dict[str, int] = lookup_block_sizes(
-        conn, dbms, list(query.table_size.keys()) if query.table_size else []
+        conn, dbms, list(query.table_size.keys()) if query.table_size else [], db_config
     )
 
     # [FIX B6] Lemma 3.2: adjust pilot rate for GROUP BY queries
@@ -1093,7 +1265,15 @@ def _execute_aqp_internal(
         for subquery_name, subquery_result in subquery_results.items():
             sampling_query = sampling_query.replace(subquery_name, subquery_result)
         logging.info(f"sampling query:\n{sampling_query}")
-        results_df = execute_query(conn, sampling_query, dbms)
+        
+        if _RESIDUAL_PLACEHOLDER_PAT.search(sampling_query):
+            logging.info("[execute] residual subquery placeholder in final sampling query; falling back to exact query.")
+            final_sample_rate = 1
+            fallback_reason = "subquery_placeholder"
+            results_df = execute_query(conn, query.query, dbms)
+        else:
+            results_df = execute_query(conn, sampling_query, dbms)
+
         logging.info(
             f"sampling execution time: {timer.check('sampling_query_execution')}"
         )
@@ -1318,7 +1498,7 @@ def execute_oracle_aqp(query: Query, db_config: dict, pilot_sample_rate: float =
     dbms = db_config["dbms"]
     conn = connect_to_db(dbms, db_config)
 
-    pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms)
+    pq = Pilot_Rewriter(query.table_cols, query.table_size, dbms, db_config)
     pilot_query = pq.rewrite(query.query) + ";"
     sampling_clause = ""
     pilot_query = pilot_query.format(sampling_method=sampling_clause)

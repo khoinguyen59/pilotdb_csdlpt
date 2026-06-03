@@ -1,0 +1,30 @@
+aqp_runtime_s,aqp_value_sample,dbms,error,exact_runtime_s,exact_value_sample,fallback_reason,fallback_triggered,final_sample_rate,max_row_relative_error,mean_row_relative_error,missing_groups_count,n_rows_aqp,n_rows_exact,pilot_sample_rate,query_id,relative_error,sf,skip_reason,skipped,speedup,timestamp_iso,variance_bound_note
+449.6640700450007,15085708766.0,postgres,,477.7025562329982,15085708766.0,cache_hit_template,True,1.0,0.0,0.0,0,4,4,1.0,q1,0.0,100,,False,1.0623542952524347,2026-05-31T02:36:33Z,
+1249.975148575999,249739810.0,postgres,,633.9424884289983,249739810.0,multi_table_no_phi,True,1,0.0,0.0,0,10,10,1.0,q3,0.0,100,,False,0.5071640737427464,2026-05-31T02:52:01Z,
+,,postgres,"aqp:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: FATAL:  the database system is shutting down
+",573.456492485002,5310749966.867,execute_aqp_exception,True,,,,,,5,1.0,q5,,100,,False,,2026-05-31T03:23:25Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: FATAL:  the database system is shutting down
+",,,,False,,,,,,,1.0,q6,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: FATAL:  the database system is shutting down
+",,,,False,,,,,,,1.0,q7,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: FATAL:  the database system is shutting down
+",,,,False,,,,,,,1.0,q8,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+",,,,False,,,,,,,1.0,q9,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+",,,,False,,,,,,,1.0,q10,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+",,,,False,,,,,,,1.0,q12,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+",,,,False,,,,,,,1.0,q14,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+",,,,False,,,,,,,1.0,q18,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,
+,,postgres,"exact:OperationalError:connection to server at ""localhost"" (127.0.0.1), port 5432 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+",,,,False,,,,,,,1.0,q19,,100,exact_execution_failed,True,,2026-05-31T03:45:56Z,

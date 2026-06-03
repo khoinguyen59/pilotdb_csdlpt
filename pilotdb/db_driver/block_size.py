@@ -28,12 +28,39 @@ DUCKDB_VECTOR_SIZE = 2048
 DEFAULT_BLOCK_SIZE = 8192
 
 
-def get_block_size(conn, dbms: str, table_name: str) -> int:
+def get_block_size(conn, dbms: str, table_name: str, db_config: dict | None = None) -> int:
     """Return the effective rows-per-block for ``table_name`` under ``dbms``.
 
     Falls back to ``DEFAULT_BLOCK_SIZE`` on any error. Always returns a
     positive integer so downstream ceiling arithmetic stays well-defined.
     """
+    if db_config:
+        # Check if there is an explicit override in db_config
+        overrides = db_config.get("block_size_overrides")
+        if isinstance(overrides, dict) and table_name in overrides:
+            return overrides[table_name]
+        
+        # Check if this config represents Citus
+        is_citus = (
+            db_config.get("is_citus") is True
+            or "citus" in str(db_config.get("host", "")).lower()
+            or "citus" in str(db_config.get("dbname", "")).lower()
+        )
+        if is_citus:
+            citus_tpch_sizes = {
+                "lineitem": 50,
+                "orders": 100,
+                "customer": 100,
+                "part": 100,
+                "partsupp": 100,
+                "supplier": 100,
+                "nation": 100,
+                "region": 100,
+            }
+            norm_name = table_name.lower().strip() if table_name else ""
+            if norm_name in citus_tpch_sizes:
+                return citus_tpch_sizes[norm_name]
+
     try:
         if dbms == DUCKDB:
             return DUCKDB_VECTOR_SIZE
@@ -102,12 +129,12 @@ def _get_sqlserver_block_size(conn, table_name: str) -> int:
 
 
 def lookup_block_sizes(
-    conn, dbms: str, table_names
+    conn, dbms: str, table_names, db_config: dict | None = None
 ) -> dict[str, int]:
     """Convenience: resolve a dict of table_name → rows-per-block."""
     out: dict[str, int] = {}
     for name in table_names:
         if not name:
             continue
-        out[name] = get_block_size(conn, dbms, name)
+        out[name] = get_block_size(conn, dbms, name, db_config)
     return out

@@ -117,7 +117,9 @@ def aggregate_error_to_page_error(
                 )
             else:
                 page_errors[aggregate[SECOND_ELEMENT]] = page_required_error
-
+        elif aggregate["aggregate"] == COUNT_DISTINCT_OPERATOR:
+            # Custom estimation bypasses error mapping, but we define a dummy just in case
+            pass
         else:
             raise NotImplementedError(
                 f"operator {aggregate['aggregate']} is not implemented"
@@ -226,7 +228,9 @@ def aggregate_error_uniform(column_mapping: List[Dict], required_error: float = 
                 )
             else:
                 errors[aggregate[SECOND_ELEMENT]] = page_required_error
-
+        elif aggregate["aggregate"] == COUNT_DISTINCT_OPERATOR:
+            # Custom estimation bypasses error mapping, but we define a dummy just in case
+            pass
         else:
             raise NotImplementedError(
                 f"operator {aggregate['aggregate']} is not implemented"

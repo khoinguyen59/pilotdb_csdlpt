@@ -40,6 +40,7 @@ class Sampling_Rewriter:
         self.aggregator_mapping = {}
         self.subquery_dict = {}
 
+
     def find_alias(self, expression):
         alias_list = expression.find_all(exp.Alias, bfs=False)
         for alias in alias_list:
@@ -255,6 +256,23 @@ class Sampling_Rewriter:
                 ):
                     new_select_expression_list.append(select_expression)
                     continue
+            
+            # Check for COUNT DISTINCT first
+            count_node = select_expression.find(exp.Count)
+            is_distinct = False
+            if count_node and (count_node.args.get("distinct") or isinstance(count_node.this, exp.Distinct)):
+                is_distinct = True
+            
+            if is_distinct:
+                if self.database == DUCKDB:
+                    inner = count_node.this
+                    if isinstance(inner, exp.Distinct):
+                        inner = inner.expressions[0] if inner.expressions else inner.this
+                    approx_node = exp.func("approx_count_distinct", inner)
+                    count_node.replace(approx_node)
+                new_select_expression_list.append(select_expression)
+                continue
+
             if (
                 select_expression.find(exp.Sum)
                 or select_expression.find(exp.Count)
@@ -455,6 +473,8 @@ class Sampling_Rewriter:
         if self.database == POSTGRES:
             pattern = r"\b(INTERVAL) '(\d+)' (DAYS)\b"
             new_query = re.sub(pattern, r"\1 '\2 \3'", new_query)
+            # Generic SQL serializes DOUBLE PRECISION as DOUBLE; Postgres rejects bare DOUBLE
+            new_query = re.sub(r'\bDOUBLE\b(?!\s+PRECISION)', 'DOUBLE PRECISION', new_query)
 
         if include_limit:
             new_query = f"SELECT TOP {limit_value} " + new_query[6:]

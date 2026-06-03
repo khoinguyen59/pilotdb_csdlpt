@@ -177,6 +177,26 @@ def _copy_csv(conn, table: str, csv_path: Path) -> int:
         return cur.rowcount
 
 
+def export_single_table_from_duckdb(
+    duckdb_src: str,
+    table: str,
+    csv_path: Path,
+) -> None:
+    """Export a single TPC-H table from DuckDB to a CSV file."""
+    conn = duckdb.connect(duckdb_src, read_only=True)
+    try:
+        conn.execute(
+            f"COPY (SELECT * FROM {table}) TO '{csv_path.as_posix()}' "
+            f"(FORMAT CSV, HEADER false, DELIMITER ',', "
+            f"DATEFORMAT '%Y-%m-%d')"
+        )
+    except Exception as e:
+        logging.error(f"[export] error exporting table {table}: {e}")
+        raise e
+    finally:
+        conn.close()
+
+
 def load(
     pg_cfg: dict,
     duckdb_src: str,
@@ -187,7 +207,7 @@ def load(
 ) -> dict[str, dict]:
     """Top-level loader. Returns per-table {action, rowcount, source}."""
     csv_dir = csv_dir or Path(duckdb_src).parent / "csv"
-    paths = export_csvs_from_duckdb(duckdb_src, csv_dir, overwrite=False)
+    csv_dir.mkdir(parents=True, exist_ok=True)
 
     _ensure_database(pg_cfg)
     conn = _pg_connect(pg_cfg, autocommit=False)
@@ -215,7 +235,7 @@ def load(
                                  sf)
                     return {t: {"action": "skip",
                                 "rowcount": existing_sizes[t],
-                                "source": str(paths[t])}
+                                "source": str(csv_dir / f"{t}.csv")}
                             for t in TPCH_TABLES}
         if if_exists == "append":
             do_recreate = False
@@ -228,10 +248,34 @@ def load(
 
         report: dict[str, dict] = {}
         for t in TPCH_TABLES:
-            csv_path = paths[t]
+            csv_path = csv_dir / f"{t}.csv"
+            
+            # 1. Export ONLY table t from DuckDB to CSV
+            logging.info(f"[export] {t} -> {csv_path}")
+            export_single_table_from_duckdb(duckdb_src, t, csv_path)
+            
+            # 2. Dynamic optimization: If t is lineitem (last table), delete the 26GB DuckDB source to free up space!
+            if t == "lineitem":
+                duck_path = Path(duckdb_src)
+                if duck_path.exists():
+                    logging.info(f"[cleanup] deleting DuckDB source file to reclaim 26GB before lineitem import: {duck_path}")
+                    duck_path.unlink()
+            
+            # 3. Load CSV into Postgres
             n = _copy_csv(conn, t, csv_path)
             logging.info(f"[pg] {t}: loaded {n} rows from {csv_path}")
+            conn.commit() # Commit each table immediately to clear locks and free transactional space!
+            
+            # 4. Cleanup CSV immediately to reclaim disk space!
+            if csv_path.exists():
+                logging.info(f"[cleanup] deleting CSV file: {csv_path}")
+                csv_path.unlink()
+                
             report[t] = {"action": "load", "rowcount": n, "source": str(csv_path)}
+        
+        logging.info("[pg] running ANALYZE to update statistics for cost model...")
+        with conn.cursor() as cur:
+            cur.execute("ANALYZE")
         conn.commit()
         return report
     finally:

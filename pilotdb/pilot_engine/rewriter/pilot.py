@@ -14,10 +14,22 @@ def _get_from(expression):
 
 
 class Pilot_Rewriter:
-    def __init__(self, table_cols, table_size, database):
+    def __init__(self, table_cols, table_size, database, db_config=None):
         self.table_cols = table_cols
         self.table_size = table_size
         self.database = database
+        self.db_config = db_config
+
+        import os
+        self.is_citus = False
+        if db_config:
+            self.is_citus = (
+                db_config.get("is_citus") is True
+                or "citus" in str(db_config.get("host", "")).lower()
+                or "citus" in str(db_config.get("dbname", "")).lower()
+            )
+        if os.environ.get("PILOTDB_IS_CITUS", "").lower() in ("true", "1"):
+            self.is_citus = True
 
         self.subquery_count = 0
         self.page_id_rank = 0
@@ -45,6 +57,7 @@ class Pilot_Rewriter:
         self.group_cols = []
         self.subquery_dict = {}
         self.limit_value = None
+
 
     def find_alias(self, expression):
         alias_list = expression.find_all(exp.Alias)
@@ -307,7 +320,10 @@ class Pilot_Rewriter:
 
     def extract_page_id_for_table(self, table_identifier, index):
         if self.database == POSTGRES:
-            expression = f"'page_id_{self.page_id_rank}:' || ({table_identifier}.ctid::text::point)[0]::int as page_id_{index}"
+            if self.is_citus:
+                expression = f"'page_id_{self.page_id_rank}:0' as page_id_{index}"
+            else:
+                expression = f"'page_id_{self.page_id_rank}:' || ({table_identifier}.ctid::text::point)[0]::int as page_id_{index}"
             self.page_id_rank += 1
             return sqlglot.parse_one(expression)
         elif self.database == DUCKDB:
@@ -803,9 +819,13 @@ class Pilot_Rewriter:
             if count_node.args.get("distinct") or isinstance(
                 count_node.this, exp.Distinct
             ):
-                self.mark_unrewritable("COUNT DISTINCT is not supported by TAQA")
-                return False
+                tables = list(expression.find_all(exp.Table))
+                has_groupby = expression.find(exp.Group) is not None
+                if len(tables) > 1 or has_groupby:
+                    self.mark_unrewritable("COUNT DISTINCT is not supported with JOIN or GROUP BY")
+                    return False
         return True
+
 
     def rewrite(self, original_query):
         if self.database == SQLSERVER:
@@ -847,6 +867,8 @@ class Pilot_Rewriter:
         elif self.database == POSTGRES:
             pattern = r"\b(INTERVAL) '(\d+)' (DAYS)\b"
             new_query = re.sub(pattern, r"\1 '\2 \3'", new_query)
+            # Generic SQL serializes DOUBLE PRECISION as DOUBLE; Postgres rejects bare DOUBLE
+            new_query = re.sub(r'\bDOUBLE\b(?!\s+PRECISION)', 'DOUBLE PRECISION', new_query)
         return new_query
 
     def log_info(self):

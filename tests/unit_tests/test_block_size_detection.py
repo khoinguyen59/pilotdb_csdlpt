@@ -97,6 +97,44 @@ class TestLookupHelper:
         assert out["orders"] == 100
 
 
+class TestConfigOverrides:
+    def test_explicit_override_in_db_config(self):
+        conn = MagicMock()
+        db_config = {
+            "block_size_overrides": {
+                "lineitem": 123,
+                "orders": 456
+            }
+        }
+        assert get_block_size(conn, POSTGRES, "lineitem", db_config) == 123
+        assert get_block_size(conn, POSTGRES, "orders", db_config) == 456
+        # If table is not in overrides, it falls back to normal path (e.g. pg_class fetch)
+        conn, cursor = _mock_conn_with_cursor((6_000_000, 120_000))
+        assert get_block_size(conn, POSTGRES, "customer", db_config) == 50
+
+
+class TestCitusDefaults:
+    def test_citus_default_sizes_by_flag(self):
+        conn = MagicMock()
+        db_config = {"is_citus": True}
+        assert get_block_size(conn, POSTGRES, "lineitem", db_config) == 50
+        assert get_block_size(conn, POSTGRES, "orders", db_config) == 100
+        assert get_block_size(conn, POSTGRES, "customer", db_config) == 100
+        # If not standard TPC-H, falls back
+        conn, cursor = _mock_conn_with_cursor((6_000_000, 120_000))
+        assert get_block_size(conn, POSTGRES, "other_table", db_config) == 50
+
+    def test_citus_default_sizes_by_host(self):
+        conn = MagicMock()
+        db_config = {"host": "citus-coordinator"}
+        assert get_block_size(conn, POSTGRES, "lineitem", db_config) == 50
+
+    def test_citus_default_sizes_by_dbname(self):
+        conn = MagicMock()
+        db_config = {"dbname": "tpch_citus"}
+        assert get_block_size(conn, POSTGRES, "lineitem", db_config) == 50
+
+
 class TestUnknownDBMS:
     def test_unknown_dbms_falls_back(self):
         conn = MagicMock()

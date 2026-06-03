@@ -1,0 +1,35 @@
+services:
+  coordinator:
+    container_name: citus_coordinator
+    image: citusdata/citus:12.1
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pilotdb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-PilotDB123}
+      POSTGRES_DB: ${POSTGRES_DB:-tpch}
+    volumes:
+      - citus_coordinator_data:/var/lib/postgresql/data
+
+  worker1:
+    container_name: citus_worker1
+    image: citusdata/citus:12.1
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pilotdb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-PilotDB123}
+      POSTGRES_DB: ${POSTGRES_DB:-tpch}
+    depends_on:
+      - coordinator
+
+  worker2:
+    container_name: citus_worker2
+    image: citusdata/citus:12.1
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pilotdb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-PilotDB123}
+      POSTGRES_DB: ${POSTGRES_DB:-tpch}
+    depends_on:
+      - coordinator
+
+volumes:
+  citus_coordinator_data:

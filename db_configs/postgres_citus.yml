@@ -1,0 +1,7 @@
+# Citus distributed Postgres configuration.
+dbname: tpch
+username: pilotdb
+host: localhost
+port: 5432
+password: PilotDB123
+is_citus: true

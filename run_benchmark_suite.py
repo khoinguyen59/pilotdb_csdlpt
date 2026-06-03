@@ -205,6 +205,11 @@ def main():
     # Save markdown report
     md_path = output_dir / "aggregated_report.md"
     
+    if sf == 1:
+        note_text = "> Threshold 10% được dùng cho assertion CI/CD vì SF=1 quá nhỏ để hit 5% một cách ổn định (sampling variance lớn trên dataset nhỏ). Trên SF=10, expect mean_row_relative_error sẽ về quanh 5%."
+    else:
+        note_text = f"> Ngưỡng sai số cấu hình rõ ràng là {error * 100.0:.0f}% (--error {error}). Trên SF={sf}, các mẫu thử có dung lượng lớn giúp kiểm chứng chính xác chất lượng ước lượng AQP dưới độ lệch mẫu thấp."
+
     md_lines = [
         "# Aggregated Benchmark Report",
         f"- **Scale Factor (SF)**: {sf}",
@@ -212,7 +217,7 @@ def main():
         f"- **Iterations**: {num_iterations} (deterministic seeds {BASE_SEED} to {BASE_SEED + num_iterations - 1})",
         "",
         "> [!NOTE]",
-        "> Threshold 10% được dùng cho assertion CI/CD vì SF=1 quá nhỏ để hit 5% một cách ổn định (sampling variance lớn trên dataset nhỏ). Trên SF=10, expect mean_row_relative_error sẽ về quanh 5%.",
+        note_text,
         "",
         "## Summary table",
         "",
@@ -252,7 +257,7 @@ def main():
         md_lines.append(
             "  > [!WARNING]\n"
             f"  > **High Fallback Rate Alert**: The overall fallback rate is {overall_fallback_rate:.2f}%, which exceeds the 30% quality threshold.\n"
-            "  > This indicates that AQP is frequently reverting to exact execution under SF=1 small-scale variance.\n"
+            f"  > This indicates that AQP is frequently reverting to exact execution under SF={sf} due to query complexity or sampling variance.\n"
         )
     else:
         md_lines.append(

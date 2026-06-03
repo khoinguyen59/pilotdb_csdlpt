@@ -652,3 +652,43 @@ class TestFullPipelineE2E:
                 f"Q14 AQP rel_err={rel_err:.4f} > 20% with fsr={fsr}"
             )
 
+    # ---- COUNT DISTINCT: single-table, no GROUP BY ----
+
+    def test_count_distinct_aqp(self, tpch_db_path):
+        """Single-table COUNT(DISTINCT) AQP estimation."""
+        from pilotdb.execute import execute_aqp
+
+        sql = "SELECT COUNT(DISTINCT l_partkey) AS distinct_parts FROM lineitem"
+        exact_df = self._get_exact_value(tpch_db_path, sql)
+        exact_count = float(exact_df["distinct_parts"].iloc[0])
+
+        query = Query(
+            name="tpch-cdistinct-e2e",
+            query=sql,
+            table_cols={"lineitem": TPCH_TABLE_COLS["lineitem"]},
+            table_size={"lineitem": 6_001_215},
+            error=0.05,
+            failure_probability=0.05,
+        )
+        db_config = {"dbms": "duckdb", "path": tpch_db_path}
+
+        aqp_df, timing = execute_aqp(query, db_config, pilot_sample_rate=1.0)
+
+        assert aqp_df is not None
+        assert len(aqp_df) > 0
+        assert "distinct_parts" in aqp_df.columns
+
+        aqp_count = float(aqp_df["distinct_parts"].iloc[0])
+        rel_err = self._relative_error(aqp_count, exact_count)
+
+        logging.info(
+            f"COUNT DISTINCT E2E: exact={exact_count:.2f}, aqp={aqp_count:.2f}, "
+            f"relative_error={rel_err:.4f} ({rel_err*100:.2f}%)"
+        )
+
+        assert rel_err < 0.15, (
+            f"COUNT DISTINCT relative error {rel_err:.4f} exceeds 15% tolerance. "
+            f"exact={exact_count:.2f}, aqp={aqp_count:.2f}"
+        )
+
+
